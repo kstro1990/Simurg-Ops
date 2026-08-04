@@ -142,11 +142,11 @@ export async function runAgentEngine(options: ExecuteAgentOptions): Promise<Agen
           content: 'Sintetizando razonamiento final y generando respuesta estructurada...',
         });
 
-        const geminiModelName =
-          agent.model === 'gemini-2.5-pro' ? 'gemini-2.5-pro' : 'gemini-2.5-flash';
-
+        // Los IDs de Gemini a nivel de app coinciden con los de la API, así que
+        // se pasan tal cual. `normalizeModel` ya ha remapeado los retirados al
+        // cargar el agente, y añadir un modelo nuevo no requiere tocar esto.
         const response = await ai.models.generateContent({
-          model: geminiModelName,
+          model: agent.model,
           contents: promptWithTools,
           config: {
             temperature: agent.temperature,

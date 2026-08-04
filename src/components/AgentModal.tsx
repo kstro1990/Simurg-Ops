@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState } from 'react';
-import { AgentConfig, AgentModel, ToolName } from '@/types/agent';
+import { AgentConfig, AgentModel, DEFAULT_MODEL, ToolName } from '@/types/agent';
 import { X, Wrench, Cpu, Check } from 'lucide-react';
 import { TOOLS } from '@/lib/tools';
 
@@ -27,8 +27,11 @@ interface ModelOption {
 }
 
 const GEMINI_MODELS: ModelOption[] = [
-  { id: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash', desc: 'Rápido y eficiente' },
-  { id: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro', desc: 'Máximo razonamiento' },
+  { id: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash', desc: 'Equilibrado, agentes y multimodal' },
+  { id: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash', desc: 'Agentes y programación' },
+  { id: 'gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro', desc: 'Razonamiento profundo (preview)' },
+  { id: 'gemini-3.5-flash-lite', label: 'Gemini 3.5 Flash-Lite', desc: 'El más rápido y barato' },
+  { id: 'gemini-3.1-flash-lite', label: 'Gemini 3.1 Flash-Lite', desc: 'Económico, alto volumen' },
 ];
 
 const ANTHROPIC_MODELS: ModelOption[] = [
@@ -53,7 +56,7 @@ export const AgentModal: React.FC<AgentModalProps> = ({ onClose, onSave, initial
   const [role, setRole] = useState(initialAgent?.role ?? '');
   const [description, setDescription] = useState(initialAgent?.description ?? '');
   const [avatar, setAvatar] = useState(initialAgent?.avatar || '🤖');
-  const [model, setModel] = useState<AgentModel>(initialAgent?.model ?? 'gemini-2.5-flash');
+  const [model, setModel] = useState<AgentModel>(initialAgent?.model ?? DEFAULT_MODEL);
   const [systemPrompt, setSystemPrompt] = useState(
     initialAgent?.systemPrompt ?? DEFAULT_SYSTEM_PROMPT
   );

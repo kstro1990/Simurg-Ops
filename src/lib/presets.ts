@@ -7,7 +7,7 @@ export const DEFAULT_AGENTS: AgentConfig[] = [
     role: 'Lead AI & Tech Research Analyst',
     description: 'Especialista en investigar tecnologías, extraer datos clave de la web y sintetizar reportes técnicos.',
     avatar: '🕵️',
-    model: 'gemini-2.5-pro',
+    model: 'gemini-3.1-pro-preview',
     systemPrompt: `Eres un Investigador Senior en Inteligencia Artificial y Tecnologías Web. 
 Tu objetivo es analizar la solicitud del usuario, realizar búsquedas profundas, validar fuentes y entregar un informe estructurado en formato Markdown con:
 1. Resumen Ejecutivo
@@ -26,7 +26,7 @@ Tu objetivo es analizar la solicitud del usuario, realizar búsquedas profundas,
     role: 'Senior Software Engineer & Architect',
     description: 'Diseña y escribe código limpio, óptimo y seguro en TypeScript, React, Python y Node.js.',
     avatar: '💻',
-    model: 'gemini-2.5-flash',
+    model: 'gemini-3.6-flash',
     systemPrompt: `Eres un Desarrollador Principal Full-Stack.
 Recibes requisitos de software y debes producir código de calidad de producción.
 Reglas:
@@ -46,7 +46,7 @@ Reglas:
     role: 'Lead Security & Quality Inspector',
     description: 'Audita código en busca de vulnerabilidades, cuellos de botella y problemas de rendimiento.',
     avatar: '🔍',
-    model: 'gemini-2.5-pro',
+    model: 'gemini-3.1-pro-preview',
     systemPrompt: `Eres un Auditor Senior de Ciberseguridad y Calidad de Código.
 Tu trabajo es revisar código entregado por otros agentes o usuarios.
 Inspecciona:
@@ -66,7 +66,7 @@ Entrega un reporte de hallazgos con severidad (Alta, Media, Baja) y las correcci
     role: 'Senior Tech Writer & Product Communicator',
     description: 'Transforma especificaciones técnicas en documentación clara, posts y presentaciones impactantes.',
     avatar: '✍️',
-    model: 'gemini-2.5-flash',
+    model: 'gemini-3.6-flash',
     systemPrompt: `Eres un Director Creativo de Contenidos Técnicos.
 Conviertes notas técnicas, análisis y código en artículos limpios, guías de onboarding o anuncios de producto con tono profesional y atractivo.`,
     temperature: 0.7,
@@ -81,7 +81,7 @@ Conviertes notas técnicas, análisis y código en artículos limpios, guías de
     role: 'Principal Product Designer',
     description: 'Diseña interfaces visuales deslumbrantes, paletas de color HSL y conceptos de UI.',
     avatar: '🎨',
-    model: 'gemini-2.5-flash',
+    model: 'gemini-3.6-flash',
     systemPrompt: `Eres un Diseñador UI/UX Principal. Tu objetivo es proponer experiencias de usuario extraordinarias con estética neón/glassmorphism, animaciones suaves y especificaciones de componentes.`,
     temperature: 0.5,
     maxTokens: 1500,
@@ -95,7 +95,7 @@ Conviertes notas técnicas, análisis y código en artículos limpios, guías de
     role: 'DevOps & Application Log Inspector',
     description: 'Monitoriza logs de la aplicación, clasifica severidades (CRITICAL, ERROR, WARN) y diagnostica causas raíz en tiempo real.',
     avatar: '🚨',
-    model: 'gemini-2.5-flash',
+    model: 'gemini-3.6-flash',
     systemPrompt: `Eres Log Sentinel, un Ingeniero Senior de SRE (Site Reliability Engineering) especializado en monitorización y diagnóstico de logs en tiempo real.
 
 Tu función:

@@ -1,8 +1,16 @@
 export type AIProvider = 'gemini' | 'claude-code' | 'anthropic' | 'copilot-cli' | 'openai';
 
+/**
+ * IDs de modelo a nivel de app. Para Gemini coinciden con los IDs de la API,
+ * así que `agentEngine` los pasa tal cual; para el resto, `providerBridge`
+ * los traduce.
+ */
 export type AgentModel =
-  | 'gemini-2.5-flash'
-  | 'gemini-2.5-pro'
+  | 'gemini-3.6-flash'
+  | 'gemini-3.5-flash'
+  | 'gemini-3.1-pro-preview'
+  | 'gemini-3.5-flash-lite'
+  | 'gemini-3.1-flash-lite'
   | 'claude-code'
   | 'claude-opus-5'
   | 'claude-sonnet-5'
@@ -13,8 +21,11 @@ export type AgentModel =
   | 'gpt-4o-mini';
 
 export const AGENT_MODELS: AgentModel[] = [
-  'gemini-2.5-flash',
-  'gemini-2.5-pro',
+  'gemini-3.6-flash',
+  'gemini-3.5-flash',
+  'gemini-3.1-pro-preview',
+  'gemini-3.5-flash-lite',
+  'gemini-3.1-flash-lite',
   'claude-code',
   'claude-opus-5',
   'claude-sonnet-5',
@@ -25,14 +36,26 @@ export const AGENT_MODELS: AgentModel[] = [
   'gpt-4o-mini',
 ];
 
+/** Modelo por defecto cuando un ID guardado no se reconoce en absoluto. */
+export const DEFAULT_MODEL: AgentModel = 'gemini-3.6-flash';
+
 /**
  * Modelos retirados o deprecados que pueden seguir guardados en data/agents.json
- * o en localStorage de instalaciones anteriores. Los IDs de Anthropic antiguos
- * devuelven 404 contra la API, así que hay que reasignarlos al cargar.
+ * o en localStorage de instalaciones anteriores. Estos IDs ya no existen en las
+ * APIs, así que hay que reasignarlos al cargar o las ejecuciones dan 404.
  */
 const LEGACY_MODEL_MAP: Record<string, AgentModel> = {
-  'gemini-1.5-flash': 'gemini-2.5-flash',
-  'gemini-1.5-pro': 'gemini-2.5-pro',
+  // Gemini 1.5 y 2.x
+  'gemini-1.5-flash': 'gemini-3.6-flash',
+  'gemini-1.5-pro': 'gemini-3.1-pro-preview',
+  'gemini-2.0-flash': 'gemini-3.6-flash',
+  'gemini-2.0-flash-lite': 'gemini-3.5-flash-lite',
+  'gemini-2.5-flash': 'gemini-3.6-flash',
+  'gemini-2.5-pro': 'gemini-3.1-pro-preview',
+  // Previews de Gemini 3 ya apagadas
+  'gemini-3-pro-preview': 'gemini-3.1-pro-preview',
+  'gemini-3.1-flash-lite-preview': 'gemini-3.1-flash-lite',
+  // Anthropic pre-4.6
   'claude-3.7-sonnet': 'claude-sonnet-5',
   'claude-3.5-sonnet': 'claude-sonnet-5',
   'claude-3.5-haiku': 'claude-haiku-4-5',
@@ -40,7 +63,7 @@ const LEGACY_MODEL_MAP: Record<string, AgentModel> = {
 
 export function normalizeModel(model: string): AgentModel {
   if ((AGENT_MODELS as string[]).includes(model)) return model as AgentModel;
-  return LEGACY_MODEL_MAP[model] || 'gemini-2.5-flash';
+  return LEGACY_MODEL_MAP[model] || DEFAULT_MODEL;
 }
 
 export interface ProviderKeys {

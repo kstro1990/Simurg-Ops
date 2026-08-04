@@ -6,7 +6,7 @@ import { AIProvider, AgentModel, ProviderKeys } from '@/types/agent';
 
 /** Modelo más barato de cada proveedor: esto solo comprueba que la clave sirve. */
 const PROBE_MODEL: Record<AIProvider, AgentModel> = {
-  gemini: 'gemini-2.5-flash',
+  gemini: 'gemini-3.5-flash-lite',
   anthropic: 'claude-haiku-4-5',
   'claude-code': 'claude-haiku-4-5',
   'copilot-cli': 'gpt-4o-mini',
