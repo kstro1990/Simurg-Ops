@@ -172,35 +172,103 @@ export const AgentModal: React.FC<AgentModalProps> = ({
             </div>
           </div>
 
-          {/* Model Selection */}
+          {/* Model Selection Grouped by Provider */}
           <div>
             <label className="flex items-center gap-1.5 text-xs font-semibold text-slate-300 mb-2">
               <Cpu className="w-4 h-4 text-indigo-400" />
-              Modelo Base (Gemini Series)
+              Modelo Base e Inteligencia Artificial
             </label>
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-              {[
-                { id: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash', desc: 'Rápido y eficiente (Recomendado)' },
-                { id: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro', desc: 'Máximo razonamiento' },
-                { id: 'gemini-1.5-flash', label: 'Gemini 1.5 Flash', desc: 'Ligero y rápido' },
-                { id: 'gemini-1.5-pro', label: 'Gemini 1.5 Pro', desc: 'Razonamiento complejo' },
-              ].map((item) => (
-                <button
-                  type="button"
-                  key={item.id}
-                  onClick={() => setModel(item.id as AgentModel)}
-                  className={`p-3 rounded-xl text-left border transition-all ${
-                    model === item.id
-                      ? 'bg-indigo-600/20 border-indigo-500 text-slate-100 shadow-md shadow-indigo-500/10'
-                      : 'bg-slate-900/60 border-white/10 text-slate-400 hover:border-white/20'
-                  }`}
-                >
-                  <div className="text-xs font-bold">{item.label}</div>
-                  <div className="text-[10px] text-slate-400 mt-0.5">{item.desc}</div>
-                </button>
-              ))}
+            
+            <div className="space-y-3">
+              {/* Google Gemini */}
+              <div>
+                <div className="text-[11px] font-bold text-indigo-400 mb-1.5 flex items-center gap-1">
+                  ♊ Google Gemini
+                </div>
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-2.5">
+                  {[
+                    { id: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash', desc: 'Rápido y eficiente' },
+                    { id: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro', desc: 'Máximo razonamiento' },
+                    { id: 'gemini-1.5-flash', label: 'Gemini 1.5 Flash', desc: 'Ligero' },
+                    { id: 'gemini-1.5-pro', label: 'Gemini 1.5 Pro', desc: 'Complejo' },
+                  ].map((item) => (
+                    <button
+                      type="button"
+                      key={item.id}
+                      onClick={() => setModel(item.id as AgentModel)}
+                      className={`p-2.5 rounded-xl text-left border transition-all ${
+                        model === item.id
+                          ? 'bg-indigo-600/25 border-indigo-500 text-slate-100 shadow-md shadow-indigo-500/10'
+                          : 'bg-slate-900/60 border-white/10 text-slate-400 hover:border-white/20'
+                      }`}
+                    >
+                      <div className="text-xs font-bold">{item.label}</div>
+                      <div className="text-[10px] text-slate-400 mt-0.5">{item.desc}</div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Claude Code & Anthropic */}
+              <div>
+                <div className="text-[11px] font-bold text-amber-400 mb-1.5 flex items-center gap-1">
+                  🎭 Anthropic & Claude Code CLI
+                </div>
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-2.5">
+                  {[
+                    { id: 'claude-code', label: 'Claude Code CLI', desc: 'Agente CLI local (claude -p)' },
+                    { id: 'claude-3.7-sonnet', label: 'Claude 3.7 Sonnet', desc: 'Pensamiento híbrido' },
+                    { id: 'claude-3.5-sonnet', label: 'Claude 3.5 Sonnet', desc: 'Codificación avanzada' },
+                    { id: 'claude-3.5-haiku', label: 'Claude 3.5 Haiku', desc: 'Ultra rápido' },
+                  ].map((item) => (
+                    <button
+                      type="button"
+                      key={item.id}
+                      onClick={() => setModel(item.id as AgentModel)}
+                      className={`p-2.5 rounded-xl text-left border transition-all ${
+                        model === item.id
+                          ? 'bg-amber-600/25 border-amber-500 text-slate-100 shadow-md shadow-amber-500/10'
+                          : 'bg-slate-900/60 border-white/10 text-slate-400 hover:border-white/20'
+                      }`}
+                    >
+                      <div className="text-xs font-bold">{item.label}</div>
+                      <div className="text-[10px] text-slate-400 mt-0.5">{item.desc}</div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* GitHub Copilot CLI */}
+              <div>
+                <div className="text-[11px] font-bold text-emerald-400 mb-1.5 flex items-center gap-1">
+                  🐙 GitHub Copilot CLI & OpenAI
+                </div>
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-2.5">
+                  {[
+                    { id: 'copilot-cli', label: 'Copilot CLI', desc: 'CLI sugiriendo comandos (gh copilot)' },
+                    { id: 'copilot-gpt-4o', label: 'Copilot GPT-4o', desc: 'Asistente de código GitHub' },
+                    { id: 'gpt-4o', label: 'OpenAI GPT-4o', desc: 'Multimodal de alta precisión' },
+                    { id: 'gpt-4o-mini', label: 'OpenAI GPT-4o Mini', desc: 'Económico y rápido' },
+                  ].map((item) => (
+                    <button
+                      type="button"
+                      key={item.id}
+                      onClick={() => setModel(item.id as AgentModel)}
+                      className={`p-2.5 rounded-xl text-left border transition-all ${
+                        model === item.id
+                          ? 'bg-emerald-600/25 border-emerald-500 text-slate-100 shadow-md shadow-emerald-500/10'
+                          : 'bg-slate-900/60 border-white/10 text-slate-400 hover:border-white/20'
+                      }`}
+                    >
+                      <div className="text-xs font-bold">{item.label}</div>
+                      <div className="text-[10px] text-slate-400 mt-0.5">{item.desc}</div>
+                    </button>
+                  ))}
+                </div>
+              </div>
             </div>
           </div>
+
 
           {/* System Prompt */}
           <div>

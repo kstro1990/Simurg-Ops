@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { AgentConfig, ExecutionRun, ThoughtStep } from '@/types/agent';
+import { AgentConfig, ExecutionRun, ThoughtStep, ProviderKeys } from '@/types/agent';
 import { Play, Terminal, Cpu, Clock, CheckCircle2, AlertCircle, Copy, Check, Sparkles, Wrench, ShieldAlert, Bot } from 'lucide-react';
 import { runAgentEngine } from '@/lib/agentEngine';
 import { TOOLS } from '@/lib/tools';
@@ -9,6 +9,7 @@ interface ExecutionPanelProps {
   agents: AgentConfig[];
   onSelectAgent: (agent: AgentConfig) => void;
   apiKey: string;
+  providerKeys?: ProviderKeys;
   onSaveRunHistory: (run: ExecutionRun) => void;
 }
 
@@ -17,6 +18,7 @@ export const ExecutionPanel: React.FC<ExecutionPanelProps> = ({
   agents,
   onSelectAgent,
   apiKey,
+  providerKeys,
   onSaveRunHistory,
 }) => {
   const [prompt, setPrompt] = useState('');
@@ -54,6 +56,7 @@ export const ExecutionPanel: React.FC<ExecutionPanelProps> = ({
         agent: selectedAgent,
         userPrompt: prompt.trim(),
         apiKey,
+        providerKeys,
         onStepUpdate: (step: ThoughtStep) => {
           setCurrentRun((prev) => {
             if (!prev) return null;

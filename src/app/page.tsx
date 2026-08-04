@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState, useEffect } from 'react';
-import { AgentConfig, ExecutionRun, WorkflowConfig, TelegramConfig } from '@/types/agent';
+import { AgentConfig, ExecutionRun, WorkflowConfig, TelegramConfig, ProviderKeys } from '@/types/agent';
 import { DEFAULT_AGENTS, DEFAULT_WORKFLOWS } from '@/lib/presets';
 import { Navbar } from '@/components/Navbar';
 import { AgentCard } from '@/components/AgentCard';
@@ -20,6 +20,7 @@ export default function Home() {
   const [selectedAgent, setSelectedAgent] = useState<AgentConfig | null>(DEFAULT_AGENTS[0]);
   const [runsHistory, setRunsHistory] = useState<ExecutionRun[]>([]);
   const [apiKey, setApiKey] = useState<string>('');
+  const [providerKeys, setProviderKeys] = useState<ProviderKeys>({});
 
   // Modals state
   const [isAgentModalOpen, setIsAgentModalOpen] = useState(false);
@@ -37,6 +38,16 @@ export default function Home() {
     try {
       const storedKey = localStorage.getItem('aether_gemini_api_key');
       if (storedKey) setApiKey(storedKey);
+
+      const storedProviderKeys = localStorage.getItem('aether_provider_keys');
+      if (storedProviderKeys) {
+        try {
+          const parsedPk = JSON.parse(storedProviderKeys);
+          setProviderKeys(parsedPk);
+        } catch {}
+      } else if (storedKey) {
+        setProviderKeys({ geminiApiKey: storedKey });
+      }
 
       const storedAgents = localStorage.getItem('aether_agents');
       if (storedAgents) {
@@ -131,6 +142,15 @@ export default function Home() {
     localStorage.setItem('aether_gemini_api_key', key);
   };
 
+  const handleSaveProviderKeys = (keys: ProviderKeys) => {
+    setProviderKeys(keys);
+    localStorage.setItem('aether_provider_keys', JSON.stringify(keys));
+    if (keys.geminiApiKey) {
+      setApiKey(keys.geminiApiKey);
+      localStorage.setItem('aether_gemini_api_key', keys.geminiApiKey);
+    }
+  };
+
   const handleSaveAgent = (agentToSave: AgentConfig) => {
     const existingIndex = agents.findIndex((a) => a.id === agentToSave.id);
     let updated: AgentConfig[];
@@ -218,6 +238,14 @@ export default function Home() {
     return matchesSearch;
   });
 
+  const hasAnyKey = Boolean(
+    apiKey?.trim() ||
+    providerKeys.geminiApiKey?.trim() ||
+    providerKeys.anthropicApiKey?.trim() ||
+    providerKeys.copilotToken?.trim() ||
+    providerKeys.openaiApiKey?.trim()
+  );
+
   return (
     <div className="min-h-screen flex flex-col bg-[#090d16] text-slate-100 selection:bg-indigo-500 selection:text-white">
       {/* Navigation Header */}
@@ -229,7 +257,7 @@ export default function Home() {
           setEditingAgent(null);
           setIsAgentModalOpen(true);
         }}
-        hasApiKey={Boolean(apiKey && apiKey.trim().length > 5)}
+        hasApiKey={hasAnyKey}
         activeAgentCount={agents.length}
       />
 
@@ -243,13 +271,13 @@ export default function Home() {
               <div className="absolute top-0 right-0 w-96 h-96 bg-gradient-to-br from-indigo-600/10 via-cyan-500/10 to-transparent blur-3xl pointer-events-none" />
               <div className="max-w-2xl space-y-3 relative z-10">
                 <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-indigo-500/10 border border-indigo-500/20 text-indigo-300 text-xs font-semibold">
-                  <Sparkles className="w-3.5 h-3.5 text-indigo-400" /> Multi-Agent AI Architecture Studio & Telegram Integration
+                  <Sparkles className="w-3.5 h-3.5 text-indigo-400" /> Multi-AI Architecture: Gemini, Claude Code, Copilot CLI & OpenAI
                 </div>
                 <h2 className="text-2xl lg:text-3xl font-extrabold tracking-tight text-slate-100">
-                  Panel de Control de <span className="text-gradient">Agentes Autónomos</span>
+                  Panel de Control de <span className="text-gradient">Agentes Multi-IA</span>
                 </h2>
                 <p className="text-sm text-slate-300 leading-relaxed">
-                  Crea y configura agentes de IA con modelos Gemini, roles únicos, system prompts especializados y enrola cada agente con su propio <strong className="text-cyan-400">Bot de Telegram</strong> autónomo.
+                  Crea y orquesta agentes autónomos conectados a <strong className="text-amber-400">Claude Code</strong>, <strong className="text-emerald-400 font-semibold">GitHub Copilot CLI</strong>, <strong className="text-indigo-400 font-semibold">Google Gemini</strong> y <strong className="text-cyan-400 font-semibold">OpenAI</strong>, enrolando cada uno a su propio bot de Telegram.
                 </p>
               </div>
             </div>
@@ -341,6 +369,7 @@ export default function Home() {
             agents={agents}
             onSelectAgent={setSelectedAgent}
             apiKey={apiKey}
+            providerKeys={providerKeys}
             onSaveRunHistory={handleSaveRunHistory}
           />
         )}
@@ -351,6 +380,7 @@ export default function Home() {
             workflows={workflows}
             agents={agents}
             apiKey={apiKey}
+            providerKeys={providerKeys}
             onSaveWorkflow={handleSaveWorkflow}
           />
         )}
@@ -374,6 +404,8 @@ export default function Home() {
         onClose={() => setIsApiKeyModalOpen(false)}
         apiKey={apiKey}
         onSaveApiKey={handleSaveApiKey}
+        providerKeys={providerKeys}
+        onSaveProviderKeys={handleSaveProviderKeys}
       />
 
       <TelegramModal

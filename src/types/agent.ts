@@ -1,4 +1,35 @@
-export type AgentModel = 'gemini-2.5-flash' | 'gemini-2.5-pro' | 'gemini-1.5-flash' | 'gemini-1.5-pro';
+export type AIProvider = 'gemini' | 'claude-code' | 'anthropic' | 'copilot-cli' | 'openai';
+
+export type AgentModel = 
+  | 'gemini-2.5-flash' 
+  | 'gemini-2.5-pro' 
+  | 'gemini-1.5-flash' 
+  | 'gemini-1.5-pro'
+  | 'claude-code'
+  | 'claude-3.7-sonnet'
+  | 'claude-3.5-sonnet'
+  | 'claude-3.5-haiku'
+  | 'copilot-cli'
+  | 'copilot-gpt-4o'
+  | 'gpt-4o'
+  | 'gpt-4o-mini';
+
+export interface ProviderKeys {
+  geminiApiKey?: string;
+  anthropicApiKey?: string;
+  copilotToken?: string;
+  openaiApiKey?: string;
+  cliBridgeUrl?: string;
+}
+
+export function getProviderFromModel(model: AgentModel): AIProvider {
+  if (model === 'claude-code') return 'claude-code';
+  if (model.startsWith('claude-')) return 'anthropic';
+  if (model.startsWith('copilot-')) return 'copilot-cli';
+  if (model.startsWith('gpt-')) return 'openai';
+  return 'gemini';
+}
+
 
 export type ToolName = 'web_search' | 'code_executor' | 'image_generator' | 'data_extractor';
 

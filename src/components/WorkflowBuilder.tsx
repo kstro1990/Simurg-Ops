@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { AgentConfig, WorkflowConfig, WorkflowStep } from '@/types/agent';
+import { AgentConfig, WorkflowConfig, WorkflowStep, ProviderKeys } from '@/types/agent';
 import { Layers, ArrowRight, Play, CheckCircle2, Clock, Plus, Trash2, Sparkles, Bot } from 'lucide-react';
 import { runAgentEngine } from '@/lib/agentEngine';
 
@@ -7,6 +7,7 @@ interface WorkflowBuilderProps {
   workflows: WorkflowConfig[];
   agents: AgentConfig[];
   apiKey: string;
+  providerKeys?: ProviderKeys;
   onSaveWorkflow: (workflow: WorkflowConfig) => void;
 }
 
@@ -14,6 +15,7 @@ export const WorkflowBuilder: React.FC<WorkflowBuilderProps> = ({
   workflows,
   agents,
   apiKey,
+  providerKeys,
   onSaveWorkflow,
 }) => {
   const [selectedWorkflow, setSelectedWorkflow] = useState<WorkflowConfig>(workflows[0] || null);
@@ -54,6 +56,7 @@ export const WorkflowBuilder: React.FC<WorkflowBuilderProps> = ({
           agent,
           userPrompt: promptForStep,
           apiKey,
+          providerKeys,
         });
 
         currentInput = result.finalOutput;

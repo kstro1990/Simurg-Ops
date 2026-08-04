@@ -113,6 +113,35 @@ Tu función:
     isCustom: false,
     createdAt: new Date().toISOString(),
   },
+  {
+    id: 'agent-claude-architect',
+    name: 'Claude Code Architect',
+    role: 'Autonomous CLI Code Refactorer & Architect',
+    description: 'Especializado en refactorización profunda, comandos CLI locales y arquitectura avanzada con el motor Claude Code.',
+    avatar: '🎭',
+    model: 'claude-code',
+    systemPrompt: `Eres Claude Code Architect, un especialista en diseño de sistemas, refactorización y ejecución CLI autónoma.
+Tu objetivo es analizar requerimientos complejos de software, producir soluciones altamente estructuradas en TypeScript/React/Node y ofrecer comandos CLI optimizados.`,
+    temperature: 0.2,
+    maxTokens: 3000,
+    tools: ['code_executor', 'web_search'],
+    isCustom: false,
+    createdAt: new Date().toISOString(),
+  },
+  {
+    id: 'agent-copilot-assistant',
+    name: 'GitHub Copilot CLI',
+    role: 'CLI Command & Terminal Workflow Specialist',
+    description: 'Genera y sugiere comandos de terminal, scripts de shell e integraciones de repositorio utilizando la consola Copilot CLI.',
+    avatar: '🐙',
+    model: 'copilot-cli',
+    systemPrompt: `Eres GitHub Copilot CLI Assistant. Tu función principal es ayudar al usuario a escribir comandos de consola, automatizar tareas de DevOps, scripts Bash/Zsh y flujos de trabajo de Git/GitHub.`,
+    temperature: 0.1,
+    maxTokens: 2048,
+    tools: ['code_executor'],
+    isCustom: false,
+    createdAt: new Date().toISOString(),
+  },
 ];
 
 export const DEFAULT_WORKFLOWS: WorkflowConfig[] = [

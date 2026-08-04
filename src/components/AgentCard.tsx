@@ -47,8 +47,16 @@ export const AgentCard: React.FC<AgentCardProps> = ({
             </div>
           </div>
 
-          <span className="flex items-center gap-1 px-2.5 py-1 text-[11px] font-mono bg-slate-900/90 text-slate-300 border border-white/10 rounded-lg shadow-sm">
-            <Cpu className="w-3 h-3 text-indigo-400" />
+          <span className={`flex items-center gap-1 px-2.5 py-1 text-[11px] font-mono rounded-lg shadow-sm border ${
+            agent.model === 'claude-code' || agent.model.startsWith('claude-')
+              ? 'bg-amber-500/10 text-amber-300 border-amber-500/30'
+              : agent.model.startsWith('copilot-')
+              ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30'
+              : agent.model.startsWith('gpt-')
+              ? 'bg-cyan-500/10 text-cyan-300 border-cyan-500/30'
+              : 'bg-indigo-500/10 text-indigo-300 border-indigo-500/30'
+          }`}>
+            <Cpu className="w-3 h-3" />
             {agent.model}
           </span>
         </div>

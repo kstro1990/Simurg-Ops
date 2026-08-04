@@ -98,11 +98,11 @@ export const Navbar: React.FC<NavbarProps> = ({
             className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition-all ${
               hasApiKey
                 ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400 hover:bg-emerald-500/20'
-                : 'bg-amber-500/10 border-amber-500/30 text-amber-300 hover:bg-amber-500/20'
+                : 'bg-indigo-500/10 border-indigo-500/30 text-indigo-300 hover:bg-indigo-500/20'
             }`}
           >
             <Key className="w-3.5 h-3.5" />
-            {hasApiKey ? 'Gemini Key Conectada' : 'Configurar API Key'}
+            {hasApiKey ? 'Conexiones IA Activas' : 'Conexiones IA / CLI'}
           </button>
 
           <button
