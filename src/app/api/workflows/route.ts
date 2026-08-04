@@ -1,12 +1,20 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getStoredWorkflows, saveStoredWorkflows } from '@/lib/serverStorage';
+import {
+  deleteStoredWorkflow,
+  getStoredWorkflows,
+  saveStoredWorkflows,
+} from '@/lib/serverStorage';
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : 'Error desconocido';
+}
 
 export async function GET() {
   try {
     const workflows = await getStoredWorkflows();
     return NextResponse.json({ success: true, workflows });
-  } catch (error: any) {
-    return NextResponse.json({ success: false, error: error.message }, { status: 500 });
+  } catch (error) {
+    return NextResponse.json({ success: false, error: errorMessage(error) }, { status: 500 });
   }
 }
 
@@ -21,7 +29,23 @@ export async function POST(req: NextRequest) {
     }
     await saveStoredWorkflows(workflows);
     return NextResponse.json({ success: true, workflows });
-  } catch (error: any) {
-    return NextResponse.json({ success: false, error: error.message }, { status: 500 });
+  } catch (error) {
+    return NextResponse.json({ success: false, error: errorMessage(error) }, { status: 500 });
+  }
+}
+
+export async function DELETE(req: NextRequest) {
+  try {
+    const workflowId = new URL(req.url).searchParams.get('id');
+    if (!workflowId) {
+      return NextResponse.json(
+        { success: false, error: 'Se requiere el query param id.' },
+        { status: 400 }
+      );
+    }
+    const workflows = await deleteStoredWorkflow(workflowId);
+    return NextResponse.json({ success: true, workflows });
+  } catch (error) {
+    return NextResponse.json({ success: false, error: errorMessage(error) }, { status: 500 });
   }
 }

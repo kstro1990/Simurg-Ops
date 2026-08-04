@@ -1,6 +1,8 @@
+'use client';
+
 import React from 'react';
 import { AgentConfig } from '@/types/agent';
-import { Play, Edit3, Trash2, Copy, Cpu, Wrench, Send, CheckCircle2 } from 'lucide-react';
+import { Play, Edit3, Trash2, Copy, Cpu, Wrench, Send } from 'lucide-react';
 import { TOOLS } from '@/lib/tools';
 
 interface AgentCardProps {
@@ -20,7 +22,9 @@ export const AgentCard: React.FC<AgentCardProps> = ({
   onDelete,
   onOpenTelegramModal,
 }) => {
-  const isTelegramConnected = agent.telegramConfig?.enabled && agent.telegramConfig?.status === 'connected';
+  const isTelegramConnected =
+    agent.telegramConfig?.enabled && agent.telegramConfig?.status === 'connected';
+  const botUsername = agent.telegramConfig?.botUsername;
 
   return (
     <div className="glass-panel glass-panel-hover rounded-2xl p-5 flex flex-col justify-between border border-white/10 relative overflow-hidden group">
@@ -48,7 +52,7 @@ export const AgentCard: React.FC<AgentCardProps> = ({
           </div>
 
           <span className={`flex items-center gap-1 px-2.5 py-1 text-[11px] font-mono rounded-lg shadow-sm border ${
-            agent.model === 'claude-code' || agent.model.startsWith('claude-')
+            agent.model.startsWith('claude-')
               ? 'bg-amber-500/10 text-amber-300 border-amber-500/30'
               : agent.model.startsWith('copilot-')
               ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30'
@@ -66,7 +70,7 @@ export const AgentCard: React.FC<AgentCardProps> = ({
           <div className="mb-3 flex items-center justify-between px-3 py-1.5 rounded-xl bg-cyan-500/10 border border-cyan-500/30 text-xs">
             <span className="flex items-center gap-1.5 font-bold text-cyan-300">
               <Send className="w-3.5 h-3.5 text-cyan-400" />
-              Telegram: @{agent.telegramConfig?.botUsername || 'Bot'}
+              {botUsername ? `Telegram: @${botUsername}` : 'Telegram enrolado'}
             </span>
             <span className="flex items-center gap-1 text-[10px] text-emerald-400 font-semibold">
               <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />

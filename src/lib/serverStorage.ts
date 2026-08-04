@@ -1,6 +1,6 @@
 import fs from 'fs/promises';
 import path from 'path';
-import { AgentConfig, WorkflowConfig, ExecutionRun, ProviderKeys } from '@/types/agent';
+import { AgentConfig, WorkflowConfig, ExecutionRun, ProviderKeys, normalizeModel } from '@/types/agent';
 import { DEFAULT_AGENTS, DEFAULT_WORKFLOWS } from '@/lib/presets';
 
 const DATA_DIR = path.join(process.cwd(), 'data');
@@ -8,120 +8,213 @@ const AGENTS_FILE = path.join(DATA_DIR, 'agents.json');
 const WORKFLOWS_FILE = path.join(DATA_DIR, 'workflows.json');
 const HISTORY_FILE = path.join(DATA_DIR, 'history.json');
 const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
+const TELEGRAM_OFFSETS_FILE = path.join(DATA_DIR, 'telegram-offsets.json');
+
+/** El historial se reescribe entero en cada ejecución: sin tope crece sin límite. */
+const HISTORY_LIMIT = 200;
 
 async function ensureDataDir() {
+  await fs.mkdir(DATA_DIR, { recursive: true });
+}
+
+/**
+ * Serializa las operaciones sobre un mismo fichero. Sin esto, dos ejecuciones
+ * concurrentes hacen read-modify-write a la vez y la última pisa a la primera.
+ */
+const locks = new Map<string, Promise<unknown>>();
+
+function withLock<T>(file: string, fn: () => Promise<T>): Promise<T> {
+  const previous = locks.get(file) ?? Promise.resolve();
+  const next = previous.then(fn, fn);
+  // La cadena de bloqueo no debe romperse si una operación falla.
+  locks.set(
+    file,
+    next.catch(() => undefined)
+  );
+  return next;
+}
+
+/**
+ * Escribe a un temporal y renombra. `rename` es atómico en POSIX, así que un
+ * fallo a mitad de escritura nunca deja el fichero destino truncado.
+ */
+async function writeJsonAtomic(file: string, data: unknown): Promise<void> {
+  await ensureDataDir();
+  const tmp = `${file}.tmp`;
+  await fs.writeFile(tmp, JSON.stringify(data, null, 2), 'utf-8');
+  await fs.rename(tmp, file);
+}
+
+interface ReadResult<T> {
+  value: T | null;
+  /** true cuando el fichero no existe (primer arranque), false si existe pero no se pudo leer. */
+  missing: boolean;
+}
+
+async function readJson<T>(file: string): Promise<ReadResult<T>> {
+  await ensureDataDir();
+  let raw: string;
   try {
-    await fs.mkdir(DATA_DIR, { recursive: true });
+    raw = await fs.readFile(file, 'utf-8');
   } catch (err) {
-    console.error('Error creating data directory:', err);
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      return { value: null, missing: true };
+    }
+    console.error(`[serverStorage] No se pudo leer ${file}:`, err);
+    return { value: null, missing: false };
+  }
+
+  try {
+    return { value: JSON.parse(raw) as T, missing: false };
+  } catch (err) {
+    // El fichero existe pero está corrupto. NO lo sobrescribimos con los
+    // presets: eso borraría los agentes del usuario. Lo apartamos para que
+    // pueda recuperarlo a mano.
+    const quarantine = `${file}.corrupt-${new Date().toISOString().replace(/[:.]/g, '-')}`;
+    console.error(`[serverStorage] ${file} está corrupto; se mueve a ${quarantine}`, err);
+    await fs.rename(file, quarantine).catch(() => undefined);
+    return { value: null, missing: true };
   }
 }
 
-// --- AGENTS STORAGE ---
+// --- AGENTES ---
+
+/** Reasigna modelos retirados para que los agentes guardados sigan funcionando. */
+function migrateAgents(agents: AgentConfig[]): AgentConfig[] {
+  return agents.map((agent) => ({ ...agent, model: normalizeModel(agent.model) }));
+}
+
 export async function getStoredAgents(): Promise<AgentConfig[]> {
-  await ensureDataDir();
-  try {
-    const data = await fs.readFile(AGENTS_FILE, 'utf-8');
-    const parsed = JSON.parse(data);
-    if (Array.isArray(parsed)) {
-      return parsed;
+  const { value, missing } = await readJson<AgentConfig[]>(AGENTS_FILE);
+
+  if (Array.isArray(value)) {
+    const migrated = migrateAgents(value);
+    // Si la migración cambió algo, persistirlo para no repetirla en cada carga.
+    if (JSON.stringify(migrated) !== JSON.stringify(value)) {
+      await saveStoredAgents(migrated);
     }
-  } catch (err) {
-    // File doesn't exist or corrupt, seed defaults on first startup
-    await saveStoredAgents(DEFAULT_AGENTS);
-    return DEFAULT_AGENTS;
+    return migrated;
   }
-  return DEFAULT_AGENTS;
+
+  if (missing) {
+    const seeded = migrateAgents(DEFAULT_AGENTS);
+    await saveStoredAgents(seeded);
+    return seeded;
+  }
+
+  // Error de E/S transitorio: devolvemos los presets pero sin escribir nada.
+  return migrateAgents(DEFAULT_AGENTS);
 }
 
 export async function saveStoredAgents(agents: AgentConfig[]): Promise<void> {
-  await ensureDataDir();
-  await fs.writeFile(AGENTS_FILE, JSON.stringify(agents, null, 2), 'utf-8');
+  await withLock(AGENTS_FILE, () => writeJsonAtomic(AGENTS_FILE, agents));
 }
 
 export async function saveOrUpdateAgent(agent: AgentConfig): Promise<AgentConfig[]> {
-  const agents = await getStoredAgents();
-  const index = agents.findIndex((a) => a.id === agent.id);
-  let updated: AgentConfig[];
-  if (index >= 0) {
-    updated = [...agents];
-    updated[index] = agent;
-  } else {
-    updated = [agent, ...agents];
-  }
-  await saveStoredAgents(updated);
-  return updated;
+  return withLock(AGENTS_FILE, async () => {
+    const { value } = await readJson<AgentConfig[]>(AGENTS_FILE);
+    const agents = Array.isArray(value) ? value : DEFAULT_AGENTS;
+    const index = agents.findIndex((a) => a.id === agent.id);
+    const updated = index >= 0 ? agents.map((a, i) => (i === index ? agent : a)) : [agent, ...agents];
+    await writeJsonAtomic(AGENTS_FILE, updated);
+    return updated;
+  });
 }
 
 export async function deleteStoredAgent(agentId: string): Promise<AgentConfig[]> {
-  const agents = await getStoredAgents();
-  const updated = agents.filter((a) => a.id !== agentId);
-  await saveStoredAgents(updated);
-  return updated;
+  return withLock(AGENTS_FILE, async () => {
+    const { value } = await readJson<AgentConfig[]>(AGENTS_FILE);
+    const agents = Array.isArray(value) ? value : DEFAULT_AGENTS;
+    const updated = agents.filter((a) => a.id !== agentId);
+    await writeJsonAtomic(AGENTS_FILE, updated);
+    return updated;
+  });
 }
 
-// --- WORKFLOWS STORAGE ---
+// --- WORKFLOWS ---
 export async function getStoredWorkflows(): Promise<WorkflowConfig[]> {
-  await ensureDataDir();
-  try {
-    const data = await fs.readFile(WORKFLOWS_FILE, 'utf-8');
-    const parsed = JSON.parse(data);
-    if (Array.isArray(parsed) && parsed.length > 0) {
-      return parsed;
-    }
-  } catch (err) {
+  const { value, missing } = await readJson<WorkflowConfig[]>(WORKFLOWS_FILE);
+
+  if (Array.isArray(value) && value.length > 0) return value;
+
+  if (missing) {
     await saveStoredWorkflows(DEFAULT_WORKFLOWS);
   }
   return DEFAULT_WORKFLOWS;
 }
 
 export async function saveStoredWorkflows(workflows: WorkflowConfig[]): Promise<void> {
-  await ensureDataDir();
-  await fs.writeFile(WORKFLOWS_FILE, JSON.stringify(workflows, null, 2), 'utf-8');
+  await withLock(WORKFLOWS_FILE, () => writeJsonAtomic(WORKFLOWS_FILE, workflows));
 }
 
-// --- HISTORY STORAGE ---
+export async function deleteStoredWorkflow(workflowId: string): Promise<WorkflowConfig[]> {
+  return withLock(WORKFLOWS_FILE, async () => {
+    const { value } = await readJson<WorkflowConfig[]>(WORKFLOWS_FILE);
+    const workflows = Array.isArray(value) ? value : DEFAULT_WORKFLOWS;
+    const updated = workflows.filter((w) => w.id !== workflowId);
+    await writeJsonAtomic(WORKFLOWS_FILE, updated);
+    return updated;
+  });
+}
+
+// --- HISTORIAL ---
 export async function getStoredHistory(): Promise<ExecutionRun[]> {
-  await ensureDataDir();
-  try {
-    const data = await fs.readFile(HISTORY_FILE, 'utf-8');
-    const parsed = JSON.parse(data);
-    if (Array.isArray(parsed)) {
-      return parsed;
-    }
-  } catch (err) {
-    // empty history by default
-  }
-  return [];
+  const { value } = await readJson<ExecutionRun[]>(HISTORY_FILE);
+  return Array.isArray(value) ? value : [];
 }
 
 export async function saveStoredHistory(history: ExecutionRun[]): Promise<void> {
-  await ensureDataDir();
-  await fs.writeFile(HISTORY_FILE, JSON.stringify(history, null, 2), 'utf-8');
+  await withLock(HISTORY_FILE, () =>
+    writeJsonAtomic(HISTORY_FILE, history.slice(0, HISTORY_LIMIT))
+  );
 }
 
 export async function addHistoryRun(run: ExecutionRun): Promise<ExecutionRun[]> {
-  const history = await getStoredHistory();
-  const updated = [run, ...history];
-  await saveStoredHistory(updated);
-  return updated;
+  return withLock(HISTORY_FILE, async () => {
+    const { value } = await readJson<ExecutionRun[]>(HISTORY_FILE);
+    const history = Array.isArray(value) ? value : [];
+    const updated = [run, ...history].slice(0, HISTORY_LIMIT);
+    await writeJsonAtomic(HISTORY_FILE, updated);
+    return updated;
+  });
 }
 
-// --- SETTINGS STORAGE ---
+// --- AJUSTES ---
 export async function getStoredSettings(): Promise<ProviderKeys> {
-  await ensureDataDir();
-  try {
-    const data = await fs.readFile(SETTINGS_FILE, 'utf-8');
-    return JSON.parse(data);
-  } catch (err) {
-    return {};
-  }
+  const { value } = await readJson<ProviderKeys>(SETTINGS_FILE);
+  return value && typeof value === 'object' ? value : {};
 }
 
 export async function saveStoredSettings(keys: ProviderKeys): Promise<ProviderKeys> {
-  await ensureDataDir();
-  const current = await getStoredSettings();
-  const updated = { ...current, ...keys };
-  await fs.writeFile(SETTINGS_FILE, JSON.stringify(updated, null, 2), 'utf-8');
-  return updated;
+  return withLock(SETTINGS_FILE, async () => {
+    const { value } = await readJson<ProviderKeys>(SETTINGS_FILE);
+    const current = value && typeof value === 'object' ? value : {};
+    const updated = { ...current, ...keys };
+    await writeJsonAtomic(SETTINGS_FILE, updated);
+    return updated;
+  });
+}
+
+// --- OFFSETS DE TELEGRAM ---
+// Deben vivir en disco: si se guardan en el estado de React se reinician al
+// recargar la página y el bot reprocesa mensajes ya atendidos.
+export type TelegramOffsets = Record<string, number>;
+
+export async function getTelegramOffsets(): Promise<TelegramOffsets> {
+  const { value } = await readJson<TelegramOffsets>(TELEGRAM_OFFSETS_FILE);
+  return value && typeof value === 'object' ? value : {};
+}
+
+/** Fusiona offsets quedándose siempre con el mayor visto por agente. */
+export async function mergeTelegramOffsets(offsets: TelegramOffsets): Promise<TelegramOffsets> {
+  return withLock(TELEGRAM_OFFSETS_FILE, async () => {
+    const { value } = await readJson<TelegramOffsets>(TELEGRAM_OFFSETS_FILE);
+    const current = value && typeof value === 'object' ? value : {};
+    const updated: TelegramOffsets = { ...current };
+    for (const [agentId, offset] of Object.entries(offsets)) {
+      updated[agentId] = Math.max(updated[agentId] ?? 0, offset);
+    }
+    await writeJsonAtomic(TELEGRAM_OFFSETS_FILE, updated);
+    return updated;
+  });
 }

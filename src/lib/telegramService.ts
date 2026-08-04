@@ -1,5 +1,6 @@
-import { AgentConfig, ExecutionRun } from '@/types/agent';
+import { AgentConfig, ExecutionRun, ProviderKeys } from '@/types/agent';
 import { runAgentEngine } from './agentEngine';
+import { runProviderBridge } from './providerBridge';
 
 export interface TelegramBotInfo {
   id: number;
@@ -54,8 +55,9 @@ export async function sendTelegramMessage(
           parse_mode: 'Markdown',
         }),
       });
-    } catch (e) {
-      // Fallback without parse_mode if Markdown parsing fails due to special characters
+    } catch {
+      // Reintento sin parse_mode: el Markdown del modelo puede tener
+      // caracteres que Telegram rechaza.
       await fetch(`https://api.telegram.org/bot${cleanToken}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -75,44 +77,78 @@ export async function processTelegramAgentRequest(options: {
   userPrompt: string;
   chatId: string | number;
   apiKey?: string;
+  providerKeys?: ProviderKeys;
   botToken: string;
 }): Promise<ExecutionRun> {
-  const { agent, userPrompt, chatId, apiKey, botToken } = options;
+  const { agent, userPrompt, chatId, apiKey, providerKeys, botToken } = options;
 
-  // Send initial "Thinking..." notification to Telegram
+  // Aviso inicial de "procesando" al chat de Telegram
   await sendTelegramMessage(
     botToken,
     chatId,
     `🤖 *${agent.name}* está procesando tu solicitud...\n\n_Pensamiento en progreso con modelo ${agent.model}_`
   );
 
-  // Execute Agent Engine
-  const result = await runAgentEngine({
-    agent,
-    userPrompt,
-    apiKey,
-  });
+  try {
+    const result = await runAgentEngine({
+      agent,
+      userPrompt,
+      apiKey,
+      providerKeys,
+      // Esto corre en el servidor: hay que invocar el puente directamente.
+      bridgeFn: runProviderBridge,
+    });
 
-  // Format final response with Agent header
-  const telegramText = `🤖 *${agent.avatar} ${agent.name}* (${agent.role}):\n\n${result.finalOutput}\n\n⏱️ _Latencia: ${result.metrics.latencyMs}ms | Tokens: ${result.metrics.totalTokens}_`;
+    const simulatedWarning = result.simulated
+      ? '\n\n⚠️ _Respuesta SIMULADA: no se pudo contactar con el proveedor._'
+      : '';
 
-  await sendTelegramMessage(botToken, chatId, telegramText);
+    const telegramText = `🤖 *${agent.avatar} ${agent.name}* (${agent.role}):\n\n${result.finalOutput}\n\n⏱️ _Latencia: ${result.metrics.latencyMs}ms | Tokens: ${result.metrics.totalTokens}_${simulatedWarning}`;
 
-  return {
-    id: 'run-tg-' + Date.now(),
-    agentId: agent.id,
-    agentName: agent.name,
-    agentAvatar: agent.avatar,
-    agentRole: agent.role,
-    prompt: userPrompt,
-    status: 'completed',
-    steps: result.steps,
-    finalOutput: result.finalOutput,
-    metrics: result.metrics,
-    timestamp: new Date().toLocaleTimeString(),
-    source: 'telegram',
-    telegramChatId: String(chatId),
-  };
+    await sendTelegramMessage(botToken, chatId, telegramText);
+
+    return {
+      id: 'run-tg-' + Date.now(),
+      agentId: agent.id,
+      agentName: agent.name,
+      agentAvatar: agent.avatar,
+      agentRole: agent.role,
+      prompt: userPrompt,
+      status: 'completed',
+      steps: result.steps,
+      finalOutput: result.finalOutput,
+      metrics: result.metrics,
+      timestamp: new Date().toISOString(),
+      source: 'telegram',
+      telegramChatId: String(chatId),
+      simulated: result.simulated,
+      provider: result.provider,
+    };
+  } catch (err) {
+    // En modo estricto el motor lanza en vez de simular: el usuario de Telegram
+    // debe enterarse del fallo en lugar de quedarse esperando.
+    const message = err instanceof Error ? err.message : String(err);
+    await sendTelegramMessage(
+      botToken,
+      chatId,
+      `❌ *${agent.name}* no pudo completar la solicitud:\n\n${message}`
+    );
+
+    return {
+      id: 'run-tg-' + Date.now(),
+      agentId: agent.id,
+      agentName: agent.name,
+      agentAvatar: agent.avatar,
+      agentRole: agent.role,
+      prompt: userPrompt,
+      status: 'failed',
+      steps: [],
+      finalOutput: message,
+      timestamp: new Date().toISOString(),
+      source: 'telegram',
+      telegramChatId: String(chatId),
+    };
+  }
 }
 
 export interface TelegramUpdate {

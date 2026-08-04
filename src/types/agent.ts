@@ -1,18 +1,47 @@
 export type AIProvider = 'gemini' | 'claude-code' | 'anthropic' | 'copilot-cli' | 'openai';
 
-export type AgentModel = 
-  | 'gemini-2.5-flash' 
-  | 'gemini-2.5-pro' 
-  | 'gemini-1.5-flash' 
-  | 'gemini-1.5-pro'
+export type AgentModel =
+  | 'gemini-2.5-flash'
+  | 'gemini-2.5-pro'
   | 'claude-code'
-  | 'claude-3.7-sonnet'
-  | 'claude-3.5-sonnet'
-  | 'claude-3.5-haiku'
+  | 'claude-opus-5'
+  | 'claude-sonnet-5'
+  | 'claude-haiku-4-5'
   | 'copilot-cli'
   | 'copilot-gpt-4o'
   | 'gpt-4o'
   | 'gpt-4o-mini';
+
+export const AGENT_MODELS: AgentModel[] = [
+  'gemini-2.5-flash',
+  'gemini-2.5-pro',
+  'claude-code',
+  'claude-opus-5',
+  'claude-sonnet-5',
+  'claude-haiku-4-5',
+  'copilot-cli',
+  'copilot-gpt-4o',
+  'gpt-4o',
+  'gpt-4o-mini',
+];
+
+/**
+ * Modelos retirados o deprecados que pueden seguir guardados en data/agents.json
+ * o en localStorage de instalaciones anteriores. Los IDs de Anthropic antiguos
+ * devuelven 404 contra la API, así que hay que reasignarlos al cargar.
+ */
+const LEGACY_MODEL_MAP: Record<string, AgentModel> = {
+  'gemini-1.5-flash': 'gemini-2.5-flash',
+  'gemini-1.5-pro': 'gemini-2.5-pro',
+  'claude-3.7-sonnet': 'claude-sonnet-5',
+  'claude-3.5-sonnet': 'claude-sonnet-5',
+  'claude-3.5-haiku': 'claude-haiku-4-5',
+};
+
+export function normalizeModel(model: string): AgentModel {
+  if ((AGENT_MODELS as string[]).includes(model)) return model as AgentModel;
+  return LEGACY_MODEL_MAP[model] || 'gemini-2.5-flash';
+}
 
 export interface ProviderKeys {
   geminiApiKey?: string;
@@ -20,6 +49,11 @@ export interface ProviderKeys {
   copilotToken?: string;
   openaiApiKey?: string;
   cliBridgeUrl?: string;
+  /**
+   * Con modo estricto activo el motor falla en vez de conmutar al simulador.
+   * Sin esto una ejecución "exitosa" puede ser texto inventado.
+   */
+  strictMode?: boolean;
 }
 
 export function getProviderFromModel(model: AgentModel): AIProvider {
@@ -67,7 +101,7 @@ export interface ThoughtStep {
   content: string;
   timestamp: string;
   toolName?: ToolName;
-  toolArgs?: Record<string, any>;
+  toolArgs?: Record<string, unknown>;
   toolResult?: string;
 }
 
@@ -92,6 +126,10 @@ export interface ExecutionRun {
   timestamp: string;
   source?: 'web' | 'telegram';
   telegramChatId?: string;
+  /** true si la salida la produjo el motor de simulación, no un modelo real. */
+  simulated?: boolean;
+  /** Proveedor que atendió la ejecución realmente. */
+  provider?: AIProvider;
 }
 
 export interface WorkflowStep {

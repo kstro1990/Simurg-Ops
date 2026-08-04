@@ -1,10 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { verifyTelegramToken } from '@/lib/telegramService';
+import { errorMessage } from '@/lib/errors';
 
 export async function POST(req: NextRequest) {
   try {
-    const body = await req.json();
-    const { botToken } = body as { botToken: string };
+    const { botToken } = (await req.json()) as { botToken?: string };
 
     if (!botToken) {
       return NextResponse.json({ error: 'Bot Token es requerido' }, { status: 400 });
@@ -12,13 +12,10 @@ export async function POST(req: NextRequest) {
 
     const botInfo = await verifyTelegramToken(botToken);
 
-    return NextResponse.json({
-      success: true,
-      botInfo,
-    });
-  } catch (err: any) {
+    return NextResponse.json({ success: true, botInfo });
+  } catch (err) {
     return NextResponse.json(
-      { error: err?.message || 'No se pudo conectar con Telegram.' },
+      { error: errorMessage(err, 'No se pudo conectar con Telegram.') },
       { status: 400 }
     );
   }

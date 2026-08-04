@@ -1,44 +1,16 @@
-import { AgentConfig, ThoughtStep, ExecutionMetrics, ProviderKeys, getProviderFromModel } from '@/types/agent';
+import {
+  AgentConfig,
+  ThoughtStep,
+  ExecutionMetrics,
+  ProviderKeys,
+  AIProvider,
+  getProviderFromModel,
+} from '@/types/agent';
+import { BridgeFn } from '@/types/bridge';
 import { TOOLS } from './tools';
 import { GoogleGenAI } from '@google/genai';
 
-export interface BridgeRequest {
-  provider: string;
-  model: string;
-  systemPrompt: string;
-  userPrompt: string;
-  temperature: number;
-  maxTokens: number;
-  keys: ProviderKeys;
-}
-
-export interface BridgeResponse {
-  success: boolean;
-  output?: string;
-  source?: string;
-  usage?: { promptTokens?: number; completionTokens?: number };
-  message?: string;
-  error?: string;
-}
-
-export type BridgeFn = (request: BridgeRequest) => Promise<BridgeResponse>;
-
-/**
- * Default bridge function — calls the Next.js API route (web mode).
- * In CLI mode, a different bridge function is injected.
- */
-export async function webBridge(request: BridgeRequest): Promise<BridgeResponse> {
-  const res = await fetch('/api/cli-bridge', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(request),
-  });
-  if (res.ok) {
-    return await res.json();
-  }
-  const errData = await res.json().catch(() => ({}));
-  return { success: false, message: errData?.message || `Bridge error ${res.status}` };
-}
+export type { BridgeRequest, BridgeResult, BridgeFn } from '@/types/bridge';
 
 export interface ExecuteAgentOptions {
   agent: AgentConfig;
@@ -46,6 +18,15 @@ export interface ExecuteAgentOptions {
   apiKey?: string;
   providerKeys?: ProviderKeys;
   onStepUpdate?: (step: ThoughtStep) => void;
+  /**
+   * Transporte hacia los proveedores no-Gemini.
+   * - Servidor y CLI: `runProviderBridge` (lib/providerBridge.ts).
+   * - Navegador: `fetchProviderBridge` (lib/bridgeClient.ts).
+   *
+   * No hay valor por defecto a propósito: el default anterior era un fetch a
+   * una URL relativa, que desde el servidor nunca resuelve y hacía que Telegram
+   * y las rutas /execute cayeran siempre al simulador sin avisar.
+   */
   bridgeFn?: BridgeFn;
 }
 
@@ -53,12 +34,32 @@ export interface AgentExecutionResult {
   steps: ThoughtStep[];
   finalOutput: string;
   metrics: ExecutionMetrics;
+  /** true si la salida la fabricó el simulador en lugar de un modelo real. */
+  simulated: boolean;
+  provider: AIProvider;
+}
+
+/**
+ * Se lanza en modo estricto cuando ningún proveedor real pudo atender la
+ * ejecución. Sin modo estricto el motor conmuta al simulador y marca el
+ * resultado con `simulated: true`.
+ */
+export class ProviderUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ProviderUnavailableError';
+  }
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
 export async function runAgentEngine(options: ExecuteAgentOptions): Promise<AgentExecutionResult> {
-  const { agent, userPrompt, apiKey, providerKeys, onStepUpdate } = options;
+  const { agent, userPrompt, apiKey, providerKeys, onStepUpdate, bridgeFn } = options;
   const startTime = Date.now();
   const steps: ThoughtStep[] = [];
+  const strictMode = Boolean(providerKeys?.strictMode);
 
   const addStep = (step: Omit<ThoughtStep, 'id' | 'timestamp'>) => {
     const fullStep: ThoughtStep = {
@@ -74,12 +75,58 @@ export async function runAgentEngine(options: ExecuteAgentOptions): Promise<Agen
   };
 
   const provider = getProviderFromModel(agent.model);
+  /** Motivos por los que cada ruta real falló, para el mensaje del modo estricto. */
+  const failures: string[] = [];
 
-  // --- 1. GEMINI PROVIDER ENGINE ---
+  /** Ejecuta las herramientas del agente y devuelve el contexto recopilado. */
+  const runTools = async (): Promise<string> => {
+    if (!agent.tools || agent.tools.length === 0) return '';
+
+    addStep({
+      type: 'thought',
+      content: `Herramientas activas asignadas a este agente: ${agent.tools.join(', ')}. Recopilando contexto...`,
+    });
+
+    let context = '';
+    for (const toolName of agent.tools) {
+      const toolDef = TOOLS[toolName];
+      if (!toolDef) continue;
+
+      addStep({
+        type: 'tool_call',
+        toolName,
+        content: `Ejecutando herramienta [${toolDef.displayName}]...`,
+        toolArgs: { query: userPrompt, prompt: userPrompt, text: userPrompt },
+      });
+
+      const toolResult = await toolDef.execute({
+        query: userPrompt,
+        prompt: userPrompt,
+        text: userPrompt,
+      });
+
+      addStep({
+        type: 'tool_result',
+        toolName,
+        content: `Resultado obtenido de ${toolDef.displayName}`,
+        toolResult,
+      });
+
+      context += `\n\n[CONTEXT FROM TOOL: ${toolDef.displayName}]:\n${toolResult}`;
+    }
+    return context;
+  };
+
+  // --- 1. MOTOR GEMINI ---
   if (provider === 'gemini') {
-    const effectiveApiKey = providerKeys?.geminiApiKey?.trim() || apiKey?.trim() || process.env.GEMINI_API_KEY || process.env.NEXT_PUBLIC_GEMINI_API_KEY || '';
+    const effectiveApiKey =
+      providerKeys?.geminiApiKey?.trim() ||
+      apiKey?.trim() ||
+      process.env.GEMINI_API_KEY ||
+      process.env.NEXT_PUBLIC_GEMINI_API_KEY ||
+      '';
 
-    if (effectiveApiKey && effectiveApiKey.length > 5) {
+    if (effectiveApiKey.length > 5) {
       try {
         addStep({
           type: 'thought',
@@ -87,47 +134,16 @@ export async function runAgentEngine(options: ExecuteAgentOptions): Promise<Agen
         });
 
         const ai = new GoogleGenAI({ apiKey: effectiveApiKey });
-        let promptWithTools = `${agent.systemPrompt}\n\n[USER REQUEST]:\n${userPrompt}`;
-        
-        if (agent.tools && agent.tools.length > 0) {
-          addStep({
-            type: 'thought',
-            content: `Herramientas activas asignadas a este agente: ${agent.tools.join(', ')}. Ejecutando análisis de capacidades...`,
-          });
-
-          for (const toolName of agent.tools) {
-            const toolDef = TOOLS[toolName];
-            if (toolDef) {
-              addStep({
-                type: 'tool_call',
-                toolName,
-                content: `Ejecutando herramienta [${toolDef.displayName}] para recopilar contexto relevante...`,
-                toolArgs: { query: userPrompt, prompt: userPrompt, text: userPrompt },
-              });
-
-              const toolResult = await toolDef.execute({ query: userPrompt, prompt: userPrompt, text: userPrompt });
-
-              addStep({
-                type: 'tool_result',
-                toolName,
-                content: `Resultado obtenido de ${toolDef.displayName}`,
-                toolResult,
-              });
-
-              promptWithTools += `\n\n[CONTEXT FROM TOOL: ${toolDef.displayName}]:\n${toolResult}`;
-            }
-          }
-        }
+        const toolContext = await runTools();
+        const promptWithTools = `${agent.systemPrompt}\n\n[USER REQUEST]:\n${userPrompt}${toolContext}`;
 
         addStep({
           type: 'thought',
-          content: `Sintetizando razonamiento final y generando respuesta estructurada...`,
+          content: 'Sintetizando razonamiento final y generando respuesta estructurada...',
         });
 
-        let geminiModelName = 'gemini-2.5-flash';
-        if (agent.model === 'gemini-2.5-pro' || agent.model === 'gemini-1.5-pro') {
-          geminiModelName = 'gemini-2.5-pro';
-        }
+        const geminiModelName =
+          agent.model === 'gemini-2.5-pro' ? 'gemini-2.5-pro' : 'gemini-2.5-flash';
 
         const response = await ai.models.generateContent({
           model: geminiModelName,
@@ -138,130 +154,122 @@ export async function runAgentEngine(options: ExecuteAgentOptions): Promise<Agen
           },
         });
 
-        const text = response.text || 'Sin respuesta del modelo.';
-        const latencyMs = Date.now() - startTime;
+        const text = response.text?.trim();
+        if (!text) {
+          throw new Error('Gemini devolvió una respuesta vacía.');
+        }
 
-        addStep({
-          type: 'output',
-          content: text,
-        });
+        addStep({ type: 'output', content: text });
 
         return {
           steps,
           finalOutput: text,
+          simulated: false,
+          provider,
           metrics: {
             promptTokens: Math.floor(userPrompt.length / 4) + 150,
             completionTokens: Math.floor(text.length / 4),
             totalTokens: Math.floor((userPrompt.length + text.length) / 4) + 150,
-            latencyMs,
+            latencyMs: Date.now() - startTime,
           },
         };
-      } catch (err: any) {
-        addStep({
-          type: 'error',
-          content: `[Gemini API Error]: ${err?.message || String(err)}. Conmutando a motor de simulación autónomo...`,
-        });
+      } catch (err) {
+        const detail = `[Gemini API Error]: ${errorMessage(err)}`;
+        failures.push(detail);
+        addStep({ type: 'error', content: detail });
       }
+    } else {
+      const detail = 'No hay una API key de Gemini configurada.';
+      failures.push(detail);
+      addStep({ type: 'error', content: `[Gemini]: ${detail}` });
     }
   }
 
-  // --- 2. CLAUDE CODE, ANTHROPIC, COPILOT CLI & OPENAI ENGINE ---
-  if (provider === 'claude-code' || provider === 'anthropic' || provider === 'copilot-cli' || provider === 'openai') {
-    try {
-      addStep({
-        type: 'thought',
-        content: `Iniciando agente ${agent.avatar} ${agent.name} [Conexión: ${provider.toUpperCase()}] usando modelo ${agent.model}...`,
-      });
-
-      // Run tools if active
-      let promptWithTools = userPrompt;
-      if (agent.tools && agent.tools.length > 0) {
+  // --- 2. MOTOR CLAUDE CODE / ANTHROPIC / COPILOT CLI / OPENAI ---
+  if (
+    provider === 'claude-code' ||
+    provider === 'anthropic' ||
+    provider === 'copilot-cli' ||
+    provider === 'openai'
+  ) {
+    if (!bridgeFn) {
+      const detail =
+        'No se proporcionó transporte hacia el proveedor (bridgeFn). Es un error de integración, no de configuración.';
+      failures.push(detail);
+      addStep({ type: 'error', content: `[${provider.toUpperCase()}]: ${detail}` });
+    } else {
+      try {
         addStep({
           type: 'thought',
-          content: `Ejecutando inspección previa de herramientas (${agent.tools.join(', ')}) para enriquecer el prompt...`,
+          content: `Iniciando agente ${agent.avatar} ${agent.name} [Conexión: ${provider.toUpperCase()}] usando modelo ${agent.model}...`,
         });
 
-        for (const toolName of agent.tools) {
-          const toolDef = TOOLS[toolName];
-          if (toolDef) {
-            addStep({
-              type: 'tool_call',
-              toolName,
-              content: `Ejecutando herramienta [${toolDef.displayName}]...`,
-              toolArgs: { query: userPrompt, prompt: userPrompt, text: userPrompt },
-            });
+        const toolContext = await runTools();
 
-            const toolResult = await toolDef.execute({ query: userPrompt, prompt: userPrompt, text: userPrompt });
+        addStep({
+          type: 'thought',
+          content: `Conectando con el proveedor ${provider}...`,
+        });
 
-            addStep({
-              type: 'tool_result',
-              toolName,
-              content: `Contexto obtenido de ${toolDef.displayName}`,
-              toolResult,
-            });
+        const bridgeResult = await bridgeFn({
+          provider,
+          model: agent.model,
+          systemPrompt: agent.systemPrompt,
+          userPrompt: `${userPrompt}${toolContext}`,
+          temperature: agent.temperature,
+          maxTokens: agent.maxTokens,
+          keys: providerKeys || {},
+        });
 
-            promptWithTools += `\n\n[CONTEXT FROM ${toolDef.displayName}]:\n${toolResult}`;
-          }
+        if (bridgeResult.success && bridgeResult.output) {
+          addStep({
+            type: 'thought',
+            content: `Respuesta recibida desde ${bridgeResult.source === 'cli_binary' ? 'binario CLI local' : 'API remota'} (${provider}).`,
+          });
+
+          addStep({ type: 'output', content: bridgeResult.output });
+
+          const promptTokens =
+            bridgeResult.usage?.promptTokens || Math.floor(userPrompt.length / 4) + 120;
+          const completionTokens =
+            bridgeResult.usage?.completionTokens || Math.floor(bridgeResult.output.length / 4);
+
+          return {
+            steps,
+            finalOutput: bridgeResult.output,
+            simulated: false,
+            provider,
+            metrics: {
+              promptTokens,
+              completionTokens,
+              totalTokens: promptTokens + completionTokens,
+              latencyMs: Date.now() - startTime,
+            },
+          };
         }
+
+        const detail = `[${provider.toUpperCase()}]: ${bridgeResult.message || 'El proveedor no devolvió salida.'}`;
+        failures.push(detail);
+        addStep({ type: 'error', content: detail });
+      } catch (err) {
+        const detail = `[Bridge Failure]: ${errorMessage(err)}`;
+        failures.push(detail);
+        addStep({ type: 'error', content: detail });
       }
-
-      addStep({
-        type: 'thought',
-        content: `Conectando con el puente servidor CLI/API de ${provider}...`,
-      });
-
-      const bridge = options.bridgeFn || webBridge;
-      const bridgeResult = await bridge({
-        provider,
-        model: agent.model,
-        systemPrompt: agent.systemPrompt,
-        userPrompt: promptWithTools,
-        temperature: agent.temperature,
-        maxTokens: agent.maxTokens,
-        keys: providerKeys || {},
-      });
-
-      if (bridgeResult.success && bridgeResult.output) {
-        const latencyMs = Date.now() - startTime;
-
-        addStep({
-          type: 'thought',
-          content: `Respuesta recibida exitosamente desde ${bridgeResult.source === 'cli_binary' ? 'Binario CLI Local' : 'API Remota'} (${provider}).`,
-        });
-
-        addStep({
-          type: 'output',
-          content: bridgeResult.output,
-        });
-
-        return {
-          steps,
-          finalOutput: bridgeResult.output,
-          metrics: {
-            promptTokens: bridgeResult.usage?.promptTokens || Math.floor(userPrompt.length / 4) + 120,
-            completionTokens: bridgeResult.usage?.completionTokens || Math.floor(bridgeResult.output.length / 4),
-            totalTokens: (bridgeResult.usage?.promptTokens || Math.floor(userPrompt.length / 4)) + (bridgeResult.usage?.completionTokens || Math.floor(bridgeResult.output.length / 4)) + 120,
-            latencyMs,
-          },
-        };
-      }
-
-      addStep({
-        type: 'error',
-        content: `[${provider.toUpperCase()} Bridge Notice]: ${bridgeResult?.message || 'No se detectó API Key ni binario CLI local'}. Conmutando a modo de simulación avanzada para ${provider}...`,
-      });
-    } catch (err: any) {
-      addStep({
-        type: 'error',
-        content: `[Bridge Failure]: ${err?.message || String(err)}. Conmutando a motor de simulación autónomo...`,
-      });
     }
   }
 
-  // --- 3. SIMULATION ENGINE (Fallback & Interactive Demo Mode) ---
+  // --- 3. MODO ESTRICTO: fallar en vez de inventar ---
+  if (strictMode) {
+    throw new ProviderUnavailableError(
+      `Ningún proveedor real pudo atender la ejecución (${provider}).\n${failures.join('\n')}`
+    );
+  }
+
+  // --- 4. MOTOR DE SIMULACIÓN (demo / fallback explícito) ---
   addStep({
     type: 'thought',
-    content: `Agente ${agent.avatar} **${agent.name}** iniciado en modo autónomo (${provider.toUpperCase()} / ${agent.model}).`,
+    content: `⚠️ Sin proveedor real disponible. Conmutando a MODO SIMULACIÓN: lo que sigue es texto generado localmente, NO proviene de ${provider.toUpperCase()}.`,
   });
 
   await delay(400);
@@ -273,87 +281,52 @@ export async function runAgentEngine(options: ExecuteAgentOptions): Promise<Agen
 
   await delay(500);
 
-  if (agent.tools && agent.tools.length > 0) {
-    for (const toolName of agent.tools) {
-      const toolDef = TOOLS[toolName];
-      if (toolDef) {
-        addStep({
-          type: 'thought',
-          content: `Invocando la herramienta autónoma [${toolDef.displayName}]...`,
-        });
-
-        await delay(400);
-
-        addStep({
-          type: 'tool_call',
-          toolName,
-          content: `Ejecutando ${toolDef.displayName}...`,
-          toolArgs: { query: userPrompt, prompt: userPrompt, text: userPrompt },
-        });
-
-        const toolResult = await toolDef.execute({ query: userPrompt, prompt: userPrompt, text: userPrompt });
-
-        await delay(300);
-
-        addStep({
-          type: 'tool_result',
-          toolName,
-          content: `Datos procesados exitosamente por ${toolDef.displayName}.`,
-          toolResult,
-        });
-      }
-    }
-  }
+  await runTools();
 
   addStep({
     type: 'thought',
-    content: `Sintetizando informe final con el motor de razonamiento ${provider}...`,
+    content: 'Sintetizando informe final con el motor de simulación...',
   });
 
   await delay(500);
 
   const simulatedOutput = generateSimulatedOutput(agent, userPrompt, provider);
-  const latencyMs = Date.now() - startTime;
 
-  addStep({
-    type: 'output',
-    content: simulatedOutput,
-  });
+  addStep({ type: 'output', content: simulatedOutput });
 
   return {
     steps,
     finalOutput: simulatedOutput,
+    simulated: true,
+    provider,
     metrics: {
       promptTokens: Math.floor(userPrompt.length / 4) + 80,
       completionTokens: Math.floor(simulatedOutput.length / 4),
       totalTokens: Math.floor((userPrompt.length + simulatedOutput.length) / 4) + 80,
-      latencyMs,
+      latencyMs: Date.now() - startTime,
     },
   };
 }
 
 function delay(ms: number) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function generateSimulatedOutput(agent: AgentConfig, prompt: string, provider: string): string {
   const pLower = prompt.toLowerCase();
+  const banner = `> ⚠️ **Respuesta simulada.** No se pudo contactar con ${provider.toUpperCase()}; este texto lo generó el motor local de demostración. Configura la API key correspondiente, o activa el modo estricto para que estas ejecuciones fallen en vez de simularse.\n\n---\n\n`;
 
-  // CLAUDE CODE CLI SPECIALIZED SIMULATION
+  // SIMULACIÓN ESPECIALIZADA DE CLAUDE CODE CLI
   if (provider === 'claude-code' || agent.model === 'claude-code') {
-    return `## 🎭 Respuesta de Claude Code CLI (${agent.name})
+    return `${banner}## 🎭 Claude Code CLI (${agent.name})
 
-**Comando Invocado:** \`claude -p "${prompt.substring(0, 60)}..."\`
+**Comando que se habría invocado:** \`claude -p "${prompt.substring(0, 60)}..."\`
 
 ---
 
-### 💻 Análisis de Código y Solución Diseñada por Claude Code:
+### 💻 Forma de la solución:
 
 \`\`\`typescript
-/**
- * Generado por Claude Code Agent Engine (${agent.model})
- * Solución optimizada para: ${prompt}
- */
 export interface ClaudeTaskRunner<T> {
   id: string;
   provider: 'claude-code';
@@ -361,184 +334,104 @@ export interface ClaudeTaskRunner<T> {
 }
 
 export class ClaudeCodeEngine implements ClaudeTaskRunner<string> {
-  public id = 'claude-agent-${Date.now()}';
-  public provider = 'claude-code' as const;
+  public readonly provider = 'claude-code' as const;
+
+  constructor(public readonly id: string) {}
 
   public async execute(input: string) {
-    console.log(\`[Claude Code] Procesando requerimiento: \${input}\`);
-    
-    // Procesamiento seguro y tipado estricto
-    return {
-      status: 'success' as const,
-      result: \`Claude Code procesó exitosamente: \${input}\`,
-    };
+    return { status: 'success' as const, result: \`Claude Code procesó: \${input}\` };
   }
 }
 \`\`\`
 
-### 📌 Razonamiento de Claude Code:
-1. **Refactorización de Arquitectura**: Estructura modular alineada a principios DRY y SOLID.
-2. **Seguridad**: Validación estricta de entradas para evitar ataques de inyección o desbordamiento de búfer.
-3. **Paso de Integración**: Puedes invocar este agente directamente desde la consola ejecutando \`claude -p "instrucción"\`.`;
+### 📌 Para obtener una respuesta real
+Configura \`ANTHROPIC_API_KEY\`, o instala el CLI \`claude\` y comprueba que está en el PATH del proceso que sirve la app.`;
   }
 
-  // COPILOT CLI SPECIALIZED SIMULATION
+  // SIMULACIÓN ESPECIALIZADA DE COPILOT CLI
   if (provider === 'copilot-cli' || agent.model.startsWith('copilot-')) {
-    return `## 🐙 GitHub Copilot CLI Recommendation (${agent.name})
+    return `${banner}## 🐙 GitHub Copilot CLI (${agent.name})
 
-**Comando GitHub Copilot:** \`gh copilot suggest "${prompt.substring(0, 60)}..."\`
+**Comando que se habría invocado:** \`gh copilot suggest "${prompt.substring(0, 60)}..."\`
 
 ---
 
-### 🚀 Comandos & Código Sugerido por Copilot CLI:
-
 \`\`\`bash
-# 1. Ejecutar el flujo de construcción del agente
-gh copilot suggest "Build Next.js web application with multi-provider AI harness"
-
-# 2. Configurar variables de entorno requeridas
-export ANTHROPIC_API_KEY="sk-ant-api..."
-export OPENAI_API_KEY="sk-proj-..."
-export GEMINI_API_KEY="AIzaSy..."
-
-# 3. Lanzar servidor de desarrollo
+# Credenciales que necesita este agente
+export OPENAI_API_KEY="sk-proj-..."   # o GITHUB_TOKEN para la ruta Copilot
 npm run dev
 \`\`\`
 
-\`\`\`typescript
-// Script de Integración de Copilot CLI en TypeScript
-import { exec } from 'child_process';
-import { promisify } from 'util';
-
-const execAsync = promisify(exec);
-
-export async function askCopilotCLI(query: string): Promise<string> {
-  const { stdout } = await execAsync(\`gh copilot suggest "\${query}"\`);
-  return stdout;
-}
-\`\`\`
-
-### 💡 Explicación de GitHub Copilot CLI:
-- **Sugerencia Directa**: Los comandos anteriores permiten conectar GitHub Copilot CLI directamente con el flujo de terminal.
-- **Sincronización**: Compatible con repositorios GitHub, OAuth y tokens de personalización.`;
+### 📌 Para obtener una respuesta real
+Configura \`OPENAI_API_KEY\` / \`GITHUB_TOKEN\`, o instala \`gh\` con la extensión Copilot.`;
   }
 
-  // GENERAL SPECIALTY SIMULATIONS
-  if (agent.id === 'agent-developer' || agent.role.toLowerCase().includes('engineer') || pLower.includes('código') || pLower.includes('code')) {
-    return `## 💻 Solución Técnica Desarrollada por ${agent.name} [${provider.toUpperCase()}]
+  // SIMULACIONES GENERALES POR ESPECIALIDAD
+  if (
+    agent.id === 'agent-developer' ||
+    agent.role.toLowerCase().includes('engineer') ||
+    pLower.includes('código') ||
+    pLower.includes('code')
+  ) {
+    return `${banner}## 💻 Esbozo técnico de ${agent.name} [${provider.toUpperCase()}]
 
-Para resolver tu requerimiento: **"${prompt}"**, he diseñado la siguiente implementación limpia en TypeScript:
+Para tu requerimiento: **"${prompt}"**, esta sería la forma de la implementación:
 
 \`\`\`typescript
-// Solution generated by ${agent.name} (${agent.model})
 export interface AgentResponse<T> {
   success: boolean;
   provider: '${provider}';
   data: T;
   timestamp: string;
-  executionMetrics: {
-    latencyMs: number;
-    tokensUsed: number;
-  };
 }
 
 export class TaskExecutor {
-  private agentId: string;
+  constructor(private readonly agentId: string) {}
 
-  constructor(agentId: string) {
-    this.agentId = agentId;
-  }
-
-  public async executeTask<T>(taskName: string, payload: Record<string, any>): Promise<AgentResponse<T>> {
+  public async executeTask<T>(taskName: string, payload: Record<string, unknown>): Promise<AgentResponse<T>> {
     console.log(\`[\${this.agentId}] Executing task: \${taskName}\`);
-    const startTime = Date.now();
-
-    const result = await this.processPayload(payload);
-
     return {
       success: true,
-      provider: '${provider}' as '${provider}',
-      data: result as T,
+      provider: '${provider}',
+      data: payload as T,
       timestamp: new Date().toISOString(),
-      executionMetrics: {
-        latencyMs: Date.now() - startTime,
-        tokensUsed: 320,
-      },
-    };
-  }
-
-  private async processPayload(payload: Record<string, any>): Promise<any> {
-    return {
-      status: "COMPLETED",
-      processedAt: new Date().toISOString(),
-      details: payload,
     };
   }
 }
 \`\`\`
 
-### 📌 Puntos Clave de la Solución:
-- **Tipado estricto**: Interfaces reutilizables con soporte genérico.
-- **Conexión Multi-IA**: Compatible con motor ${provider.toUpperCase()} (${agent.model}).
-- **Escalabilidad**: Listo para producción.`;
+Es una plantilla genérica, no una solución analizada para tu caso. Configura el proveedor para obtener una respuesta real.`;
   }
 
   if (agent.id === 'agent-auditor' || agent.role.toLowerCase().includes('security')) {
-    return `## 🔍 Reporte de Auditoría de Código y Seguridad [${provider.toUpperCase()}]
+    return `${banner}## 🔍 Auditoría NO realizada [${provider.toUpperCase()}]
 
-**Auditor:** ${agent.name} (${agent.role})  
-**Modelo Motor:** ${agent.model}  
-**Objetivo de Inspección:** "${prompt}"
+**Auditor:** ${agent.name} (${agent.role})
+**Objetivo:** "${prompt}"
 
 ---
 
-### 🛡️ Matriz de Evaluación de Calidad
+| Criterio | Estado | Observación |
+| :--- | :---: | :--- |
+| **Seguridad OWASP** | ⚪ Sin evaluar | Requiere un modelo real |
+| **Conexión al proveedor** | 🔴 Sin conexión | No se alcanzó ${provider} |
+| **Manejo de excepciones** | ⚪ Sin evaluar | Requiere un modelo real |
 
-| Criterio | Calificación | Estado | Observación |
-| :--- | :---: | :---: | :--- |
-| **Seguridad OWASP** | 9.7 / 10 | 🟢 Aprobado | Sin inyecciones ni datos sensibles expuestos |
-| **Integración CLI / Provider** | 9.5 / 10 | 🟢 Aprobado | Conexión fluida con ${provider} |
-| **Maniobra de Excepciones** | 9.0 / 10 | 🟢 Aprobado | Manejo seguro de bloques try/catch |
-
-### 🛠️ Correcciones Sugeridas (Diff):
-
-\`\`\`diff
-- const data = await fetch(url);
-- return data.json();
-+ try {
-+   const response = await fetch(url, { signal: AbortSignal.timeout(5000) });
-+   if (!response.ok) throw new Error(\`HTTP error \${response.status}\`);
-+   return await response.json();
-+ } catch (err) {
-+   console.error("[Audit Warning] Fetch timeout or network failure", err);
-+   throw err;
-+ }
-\`\`\`
-
-### Verdict Final:
-El componente cumple con los estándares exigidos para entornos de producción en ${provider.toUpperCase()}.`;
+### Veredicto
+Ninguno. No trates esta salida como una auditoría: configura la API key del proveedor.`;
   }
 
-  return `## 📑 Informe Generado por ${agent.name} [${provider.toUpperCase()}]
+  return `${banner}## 📑 Informe de ${agent.name} [${provider.toUpperCase()}]
 
-**Rol:** ${agent.role}  
-**Modelo Motor:** ${agent.model}  
-**Consulta Atendida:** "${prompt}"
-
----
-
-### 💡 Análisis Principal
-Procesado mediante el motor **${provider.toUpperCase()}** con inspección de contexto y razonamiento autónomo.
-
-1. **Diagnóstico Inicial**: Se evaluó la solicitud utilizando las capacidades avanzadas de ${agent.model}.
-2. **Síntesis de Resultados**:
-   - Integración multi-proveedor activa con respuesta optimizada.
-   - Configuración de temperatura (${agent.temperature}) calibrada.
+**Rol:** ${agent.role}
+**Modelo solicitado:** ${agent.model}
+**Consulta:** "${prompt}"
 
 ---
 
-### 🚀 Recomendación del Agente
-> "${agent.description}"
+### 💡 Qué habría pasado
+Esta consulta se habría procesado con **${provider.toUpperCase()}** a temperatura ${agent.temperature}, pero no hubo conexión con el proveedor.
 
-Puedes encadenar este agente con otros en la pestaña de **Workflows**.`;
+### 🚀 Siguiente paso
+Abre el modal de claves API y configura la credencial de **${provider}**, o cambia el modelo del agente a uno cuyo proveedor sí tengas configurado.`;
 }

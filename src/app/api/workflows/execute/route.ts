@@ -1,15 +1,18 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { runAgentEngine } from '@/lib/agentEngine';
-import { AgentConfig, WorkflowConfig } from '@/types/agent';
+import { runProviderBridge } from '@/lib/providerBridge';
+import { getStoredSettings } from '@/lib/serverStorage';
+import { AgentConfig, ProviderKeys, WorkflowConfig } from '@/types/agent';
 
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const { workflow, agentsMap, initialPrompt, apiKey } = body as {
+    const { workflow, agentsMap, initialPrompt, apiKey, providerKeys } = body as {
       workflow: WorkflowConfig;
       agentsMap: Record<string, AgentConfig>;
       initialPrompt: string;
       apiKey?: string;
+      providerKeys?: ProviderKeys;
     };
 
     if (!workflow || !agentsMap || !initialPrompt) {
@@ -19,11 +22,14 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    const storedKeys = await getStoredSettings();
+    const effectiveKeys = { ...storedKeys, ...(providerKeys || {}) };
+
     let currentInput = initialPrompt;
     const stepResults = [];
+    let anySimulated = false;
 
-    for (let i = 0; i < workflow.steps.length; i++) {
-      const step = workflow.steps[i];
+    for (const step of workflow.steps) {
       const agent = agentsMap[step.agentId];
 
       if (!agent) {
@@ -38,20 +44,28 @@ export async function POST(req: NextRequest) {
         agent,
         userPrompt: promptForStep,
         apiKey,
+        providerKeys: effectiveKeys,
+        bridgeFn: runProviderBridge,
       });
+
+      anySimulated = anySimulated || result.simulated;
 
       stepResults.push({
         stepId: step.id,
         stepName: step.stepName,
+        agentId: agent.id,
         agentName: agent.name,
         agentAvatar: agent.avatar,
+        agentRole: agent.role,
         input: promptForStep,
         output: result.finalOutput,
         steps: result.steps,
+        metrics: result.metrics,
+        simulated: result.simulated,
         status: 'completed' as const,
       });
 
-      // Pass current step output as input to next agent
+      // La salida de cada paso alimenta el prompt del siguiente.
       currentInput = result.finalOutput;
     }
 
@@ -61,10 +75,13 @@ export async function POST(req: NextRequest) {
       workflowName: workflow.name,
       stepResults,
       finalOutput: currentInput,
+      simulated: anySimulated,
     });
-  } catch (err: any) {
+  } catch (err) {
     return NextResponse.json(
-      { error: err?.message || 'Error en la ejecución del flujo multi-agente.' },
+      {
+        error: err instanceof Error ? err.message : 'Error en la ejecución del flujo multi-agente.',
+      },
       { status: 500 }
     );
   }

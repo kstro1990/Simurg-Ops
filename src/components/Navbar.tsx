@@ -1,6 +1,6 @@
 'use client';
 import React from 'react';
-import { Bot, Key, Plus, History, Layers, Terminal, Sparkles } from 'lucide-react';
+import { Bot, Key, Plus, History, Layers, Terminal } from 'lucide-react';
 
 interface NavbarProps {
   activeTab: 'agents' | 'workbench' | 'workflows' | 'history';

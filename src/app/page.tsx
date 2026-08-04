@@ -1,7 +1,13 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
-import { AgentConfig, ExecutionRun, WorkflowConfig, TelegramConfig, ProviderKeys } from '@/types/agent';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  AgentConfig,
+  ExecutionRun,
+  WorkflowConfig,
+  TelegramConfig,
+  ProviderKeys,
+} from '@/types/agent';
 import { DEFAULT_AGENTS, DEFAULT_WORKFLOWS } from '@/lib/presets';
 import { Navbar } from '@/components/Navbar';
 import { AgentCard } from '@/components/AgentCard';
@@ -13,8 +19,12 @@ import { ApiKeyModal } from '@/components/ApiKeyModal';
 import { TelegramModal } from '@/components/TelegramModal';
 import { Search, Sparkles, Send } from 'lucide-react';
 
+const TELEGRAM_POLL_INTERVAL_MS = 3000;
+
 export default function Home() {
-  const [activeTab, setActiveTab] = useState<'agents' | 'workbench' | 'workflows' | 'history'>('agents');
+  const [activeTab, setActiveTab] = useState<'agents' | 'workbench' | 'workflows' | 'history'>(
+    'agents'
+  );
   const [agents, setAgents] = useState<AgentConfig[]>(DEFAULT_AGENTS);
   const [workflows, setWorkflows] = useState<WorkflowConfig[]>(DEFAULT_WORKFLOWS);
   const [selectedAgent, setSelectedAgent] = useState<AgentConfig | null>(DEFAULT_AGENTS[0]);
@@ -22,21 +32,19 @@ export default function Home() {
   const [apiKey, setApiKey] = useState<string>('');
   const [providerKeys, setProviderKeys] = useState<ProviderKeys>({});
 
-  // Modals state
+  // Modales
   const [isAgentModalOpen, setIsAgentModalOpen] = useState(false);
   const [editingAgent, setEditingAgent] = useState<AgentConfig | null>(null);
   const [isApiKeyModalOpen, setIsApiKeyModalOpen] = useState(false);
-  const [isTelegramModalOpen, setIsTelegramModalOpen] = useState(false);
   const [telegramAgent, setTelegramAgent] = useState<AgentConfig | null>(null);
 
-  // Search & Filter
+  // Búsqueda y filtros
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedCategory, setSelectedCategory] = useState<string>('all');
 
-  // Load state from server APIs with localStorage fallback on mount
+  // Carga inicial: el servidor manda; localStorage solo es respaldo si falla.
   useEffect(() => {
     async function loadInitialData() {
-      // 1. Settings & Keys
       let serverSettingsLoaded = false;
       try {
         const resSettings = await fetch('/api/settings');
@@ -57,23 +65,23 @@ export default function Home() {
 
       if (!serverSettingsLoaded) {
         const storedKey = localStorage.getItem('aether_gemini_api_key');
-        if (storedKey && !apiKey) setApiKey(storedKey);
+        if (storedKey) setApiKey(storedKey);
         const storedProviderKeys = localStorage.getItem('aether_provider_keys');
         if (storedProviderKeys) {
           try {
-            const parsedPk = JSON.parse(storedProviderKeys);
-            setProviderKeys((prev) => ({ ...prev, ...parsedPk }));
-          } catch {}
+            setProviderKeys((prev) => ({ ...prev, ...JSON.parse(storedProviderKeys) }));
+          } catch {
+            // Respaldo corrupto: se ignora.
+          }
         }
       }
 
-      // 2. Agents
       let serverAgentsLoaded = false;
       try {
         const resAgents = await fetch('/api/agents');
         if (resAgents.ok) {
           const dataAgents = await resAgents.json();
-          if (dataAgents.success && Array.isArray(dataAgents.agents) && dataAgents.agents.length > 0) {
+          if (dataAgents.success && Array.isArray(dataAgents.agents) && dataAgents.agents.length) {
             setAgents(dataAgents.agents);
             setSelectedAgent(dataAgents.agents[0]);
             localStorage.setItem('aether_agents', JSON.stringify(dataAgents.agents));
@@ -93,11 +101,12 @@ export default function Home() {
               setAgents(parsed);
               setSelectedAgent(parsed[0]);
             }
-          } catch {}
+          } catch {
+            // Respaldo corrupto: se ignora.
+          }
         }
       }
 
-      // 3. Workflows
       let serverWorkflowsLoaded = false;
       try {
         const resWf = await fetch('/api/workflows');
@@ -121,11 +130,12 @@ export default function Home() {
             if (Array.isArray(parsedWf) && parsedWf.length > 0) {
               setWorkflows(parsedWf);
             }
-          } catch {}
+          } catch {
+            // Respaldo corrupto: se ignora.
+          }
         }
       }
 
-      // 4. History
       try {
         const resHist = await fetch('/api/history');
         if (resHist.ok) {
@@ -143,57 +153,48 @@ export default function Home() {
     loadInitialData();
   }, []);
 
-  const [telegramOffsets, setTelegramOffsets] = useState<Record<string, number>>({});
+  const hasEnrolledTelegramAgents = agents.some(
+    (a) => a.telegramConfig?.enabled && a.telegramConfig?.botToken
+  );
 
-  // Background Telegram Polling Loop (Long Polling for Local Dev & Real-Time responses)
+  // Sondeo de Telegram. Los offsets y los agentes viven en el servidor; aquí
+  // solo se dispara el tick y se recogen las ejecuciones nuevas.
+  const isPollingRef = useRef(false);
   useEffect(() => {
-    const hasEnrolledTelegramAgents = agents.some(
-      (a) => a.telegramConfig?.enabled && a.telegramConfig?.botToken
-    );
     if (!hasEnrolledTelegramAgents) return;
 
-    let isPolling = false;
+    let cancelled = false;
+
     const pollTelegramMessages = async () => {
-      if (isPolling) return;
-      isPolling = true;
+      if (isPollingRef.current) return;
+      isPollingRef.current = true;
       try {
-        const res = await fetch('/api/telegram/poll', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            agents,
-            apiKey,
-            offsets: telegramOffsets,
-          }),
-        });
+        const res = await fetch('/api/telegram/poll', { method: 'POST' });
         const data = await res.json();
-        if (data.success) {
-          if (data.newOffsets) {
-            setTelegramOffsets((prev) => ({ ...prev, ...data.newOffsets }));
-          }
-          if (Array.isArray(data.newRuns) && data.newRuns.length > 0) {
-            setRunsHistory((prev) => {
-              const updatedHistory = [...data.newRuns, ...prev];
-              localStorage.setItem('aether_history', JSON.stringify(updatedHistory));
-              return updatedHistory;
-            });
-          }
+        if (!cancelled && data.success && Array.isArray(data.newRuns) && data.newRuns.length > 0) {
+          setRunsHistory((prev) => {
+            const updated = [...data.newRuns, ...prev];
+            localStorage.setItem('aether_history', JSON.stringify(updated));
+            return updated;
+          });
         }
       } catch (err) {
         console.error('Error polling Telegram messages:', err);
       } finally {
-        isPolling = false;
+        isPollingRef.current = false;
       }
     };
 
-    const intervalId = setInterval(pollTelegramMessages, 3000);
+    const intervalId = window.setInterval(pollTelegramMessages, TELEGRAM_POLL_INTERVAL_MS);
     pollTelegramMessages();
 
-    return () => clearInterval(intervalId);
-  }, [agents, apiKey, telegramOffsets]);
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [hasEnrolledTelegramAgents]);
 
-  // Save changes to Server API & localStorage
-  const saveAgentsToStorage = async (newAgents: AgentConfig[]) => {
+  const saveAgentsToStorage = useCallback(async (newAgents: AgentConfig[]) => {
     setAgents(newAgents);
     localStorage.setItem('aether_agents', JSON.stringify(newAgents));
     try {
@@ -205,13 +206,7 @@ export default function Home() {
     } catch (err) {
       console.error('Error saving agents to server:', err);
     }
-  };
-
-  const handleSaveApiKey = (key: string) => {
-    setApiKey(key);
-    localStorage.setItem('aether_gemini_api_key', key);
-    saveStoredKeysToServer({ ...providerKeys, geminiApiKey: key });
-  };
+  }, []);
 
   const saveStoredKeysToServer = async (keys: ProviderKeys) => {
     try {
@@ -223,6 +218,11 @@ export default function Home() {
     } catch (err) {
       console.error('Error saving settings to server:', err);
     }
+  };
+
+  const handleSaveApiKey = (key: string) => {
+    setApiKey(key);
+    localStorage.setItem('aether_gemini_api_key', key);
   };
 
   const handleSaveProviderKeys = (keys: ProviderKeys) => {
@@ -237,31 +237,29 @@ export default function Home() {
 
   const handleSaveAgent = (agentToSave: AgentConfig) => {
     const existingIndex = agents.findIndex((a) => a.id === agentToSave.id);
-    let updated: AgentConfig[];
-    if (existingIndex >= 0) {
-      updated = [...agents];
-      updated[existingIndex] = agentToSave;
-    } else {
-      updated = [agentToSave, ...agents];
-    }
+    const updated =
+      existingIndex >= 0
+        ? agents.map((a, i) => (i === existingIndex ? agentToSave : a))
+        : [agentToSave, ...agents];
     saveAgentsToStorage(updated);
     setSelectedAgent(agentToSave);
   };
 
   const handleSaveTelegramConfig = (agentId: string, telegramConfig: TelegramConfig) => {
-    const updated = agents.map((a) => {
-      if (a.id === agentId) {
-        return {
-          ...a,
-          telegramConfig,
-        };
-      }
-      return a;
-    });
+    const updated = agents.map((a) => (a.id === agentId ? { ...a, telegramConfig } : a));
     saveAgentsToStorage(updated);
   };
 
   const handleDeleteAgent = async (agentId: string) => {
+    const agent = agents.find((a) => a.id === agentId);
+    if (
+      !window.confirm(
+        `¿Eliminar el agente "${agent?.name ?? agentId}"? Esta acción no se puede deshacer.`
+      )
+    ) {
+      return;
+    }
+
     const updated = agents.filter((a) => a.id !== agentId);
     setAgents(updated);
     localStorage.setItem('aether_agents', JSON.stringify(updated));
@@ -269,7 +267,7 @@ export default function Home() {
       setSelectedAgent(updated[0] || null);
     }
     try {
-      await fetch(`/api/agents?id=${agentId}`, { method: 'DELETE' });
+      await fetch(`/api/agents?id=${encodeURIComponent(agentId)}`, { method: 'DELETE' });
     } catch (err) {
       console.error('Error deleting agent on server:', err);
     }
@@ -280,11 +278,13 @@ export default function Home() {
       ...agentToClone,
       id: 'agent-' + Date.now(),
       name: `${agentToClone.name} (Copia)`,
+      // Un clon no hereda el bot: dos agentes con el mismo token competirían
+      // por los mismos updates de Telegram.
+      telegramConfig: undefined,
       isCustom: true,
       createdAt: new Date().toISOString(),
     };
-    const updated = [cloned, ...agents];
-    saveAgentsToStorage(updated);
+    saveAgentsToStorage([cloned, ...agents]);
     setSelectedAgent(cloned);
   };
 
@@ -303,10 +303,23 @@ export default function Home() {
     }
   };
 
+  const handleDeleteWorkflow = async (workflowId: string) => {
+    const updated = workflows.filter((w) => w.id !== workflowId);
+    setWorkflows(updated);
+    localStorage.setItem('aether_workflows', JSON.stringify(updated));
+    try {
+      await fetch(`/api/workflows?id=${encodeURIComponent(workflowId)}`, { method: 'DELETE' });
+    } catch (err) {
+      console.error('Error deleting workflow on server:', err);
+    }
+  };
+
   const handleSaveRunHistory = async (newRun: ExecutionRun) => {
-    const updated = [newRun, ...runsHistory];
-    setRunsHistory(updated);
-    localStorage.setItem('aether_history', JSON.stringify(updated));
+    setRunsHistory((prev) => {
+      const updated = [newRun, ...prev];
+      localStorage.setItem('aether_history', JSON.stringify(updated));
+      return updated;
+    });
     try {
       await fetch('/api/history', {
         method: 'POST',
@@ -333,17 +346,12 @@ export default function Home() {
     setActiveTab('workbench');
   };
 
-  const handleOpenTelegramModal = (agent: AgentConfig) => {
-    setTelegramAgent(agent);
-    setIsTelegramModalOpen(true);
-  };
-
-  // Filtered agents
   const filteredAgents = agents.filter((agent) => {
+    const q = searchQuery.toLowerCase();
     const matchesSearch =
-      agent.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      agent.role.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      agent.description.toLowerCase().includes(searchQuery.toLowerCase());
+      agent.name.toLowerCase().includes(q) ||
+      agent.role.toLowerCase().includes(q) ||
+      agent.description.toLowerCase().includes(q);
 
     if (selectedCategory === 'telegram') return matchesSearch && agent.telegramConfig?.enabled;
     if (selectedCategory === 'custom') return matchesSearch && agent.isCustom;
@@ -353,15 +361,14 @@ export default function Home() {
 
   const hasAnyKey = Boolean(
     apiKey?.trim() ||
-    providerKeys.geminiApiKey?.trim() ||
-    providerKeys.anthropicApiKey?.trim() ||
-    providerKeys.copilotToken?.trim() ||
-    providerKeys.openaiApiKey?.trim()
+      providerKeys.geminiApiKey?.trim() ||
+      providerKeys.anthropicApiKey?.trim() ||
+      providerKeys.copilotToken?.trim() ||
+      providerKeys.openaiApiKey?.trim()
   );
 
   return (
     <div className="min-h-screen flex flex-col bg-[#090d16] text-slate-100 selection:bg-indigo-500 selection:text-white">
-      {/* Navigation Header */}
       <Navbar
         activeTab={activeTab}
         setActiveTab={setActiveTab}
@@ -374,30 +381,39 @@ export default function Home() {
         activeAgentCount={agents.length}
       />
 
-      {/* Main Container */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 lg:px-8 py-8">
-        {/* TAB 1: AGENTS DASHBOARD */}
+        {/* PESTAÑA 1: AGENTES */}
         {activeTab === 'agents' && (
           <div className="space-y-6">
-            {/* Hero / Header Section */}
             <div className="glass-panel rounded-2xl p-6 lg:p-8 border border-white/10 relative overflow-hidden">
               <div className="absolute top-0 right-0 w-96 h-96 bg-gradient-to-br from-indigo-600/10 via-cyan-500/10 to-transparent blur-3xl pointer-events-none" />
               <div className="max-w-2xl space-y-3 relative z-10">
                 <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-indigo-500/10 border border-indigo-500/20 text-indigo-300 text-xs font-semibold">
-                  <Sparkles className="w-3.5 h-3.5 text-indigo-400" /> Multi-AI Architecture: Gemini, Claude Code, Copilot CLI & OpenAI
+                  <Sparkles className="w-3.5 h-3.5 text-indigo-400" /> Multi-AI Architecture:
+                  Gemini, Claude Code, Copilot CLI & OpenAI
                 </div>
                 <h2 className="text-2xl lg:text-3xl font-extrabold tracking-tight text-slate-100">
                   Panel de Control de <span className="text-gradient">Agentes Multi-IA</span>
                 </h2>
                 <p className="text-sm text-slate-300 leading-relaxed">
-                  Crea y orquesta agentes autónomos conectados a <strong className="text-amber-400">Claude Code</strong>, <strong className="text-emerald-400 font-semibold">GitHub Copilot CLI</strong>, <strong className="text-indigo-400 font-semibold">Google Gemini</strong> y <strong className="text-cyan-400 font-semibold">OpenAI</strong>, enrolando cada uno a su propio bot de Telegram.
+                  Crea y orquesta agentes autónomos conectados a{' '}
+                  <strong className="text-amber-400">Claude Code</strong>,{' '}
+                  <strong className="text-emerald-400 font-semibold">GitHub Copilot CLI</strong>,{' '}
+                  <strong className="text-indigo-400 font-semibold">Google Gemini</strong> y{' '}
+                  <strong className="text-cyan-400 font-semibold">OpenAI</strong>, enrolando cada
+                  uno a su propio bot de Telegram.
                 </p>
+                {!providerKeys.strictMode && (
+                  <p className="text-[11px] text-amber-300/90 bg-amber-950/30 border border-amber-500/25 rounded-lg px-3 py-2">
+                    El modo estricto está desactivado: si un proveedor no responde, las ejecuciones
+                    se completan con texto simulado (marcado como tal). Actívalo en el modal de
+                    claves para que fallen en su lugar.
+                  </p>
+                )}
               </div>
             </div>
 
-            {/* Filter Bar */}
             <div className="flex flex-col md:flex-row items-center justify-between gap-4">
-              {/* Search input */}
               <div className="relative w-full md:w-96">
                 <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
                 <input
@@ -409,7 +425,6 @@ export default function Home() {
                 />
               </div>
 
-              {/* Category Pills */}
               <div className="flex flex-wrap items-center gap-2 bg-slate-900/80 p-1 rounded-xl border border-white/5 w-full md:w-auto justify-center">
                 <button
                   onClick={() => setSelectedCategory('all')}
@@ -455,7 +470,6 @@ export default function Home() {
               </div>
             </div>
 
-            {/* Agent Grid */}
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
               {filteredAgents.map((agent) => (
                 <AgentCard
@@ -468,14 +482,14 @@ export default function Home() {
                   }}
                   onClone={handleCloneAgent}
                   onDelete={handleDeleteAgent}
-                  onOpenTelegramModal={handleOpenTelegramModal}
+                  onOpenTelegramModal={setTelegramAgent}
                 />
               ))}
             </div>
           </div>
         )}
 
-        {/* TAB 2: WORKBENCH */}
+        {/* PESTAÑA 2: WORKBENCH */}
         {activeTab === 'workbench' && (
           <ExecutionPanel
             selectedAgent={selectedAgent}
@@ -487,7 +501,7 @@ export default function Home() {
           />
         )}
 
-        {/* TAB 3: WORKFLOWS */}
+        {/* PESTAÑA 3: WORKFLOWS */}
         {activeTab === 'workflows' && (
           <WorkflowBuilder
             workflows={workflows}
@@ -495,39 +509,48 @@ export default function Home() {
             apiKey={apiKey}
             providerKeys={providerKeys}
             onSaveWorkflow={handleSaveWorkflow}
+            onDeleteWorkflow={handleDeleteWorkflow}
+            onSaveRunHistory={handleSaveRunHistory}
           />
         )}
 
-        {/* TAB 4: HISTORY */}
+        {/* PESTAÑA 4: HISTORIAL */}
         {activeTab === 'history' && (
           <HistoryModal runs={runsHistory} onClearHistory={handleClearHistory} />
         )}
       </main>
 
-      {/* Modals */}
-      <AgentModal
-        isOpen={isAgentModalOpen}
-        onClose={() => setIsAgentModalOpen(false)}
-        onSave={handleSaveAgent}
-        initialAgent={editingAgent}
-      />
+      {/* Los modales se montan al abrirse (con `key`) para que su estado se
+          inicialice desde las props en lugar de sincronizarse con un efecto. */}
+      {isAgentModalOpen && (
+        <AgentModal
+          key={editingAgent?.id ?? 'new-agent'}
+          onClose={() => setIsAgentModalOpen(false)}
+          onSave={handleSaveAgent}
+          initialAgent={editingAgent}
+        />
+      )}
 
-      <ApiKeyModal
-        isOpen={isApiKeyModalOpen}
-        onClose={() => setIsApiKeyModalOpen(false)}
-        apiKey={apiKey}
-        onSaveApiKey={handleSaveApiKey}
-        providerKeys={providerKeys}
-        onSaveProviderKeys={handleSaveProviderKeys}
-      />
+      {isApiKeyModalOpen && (
+        <ApiKeyModal
+          onClose={() => setIsApiKeyModalOpen(false)}
+          apiKey={apiKey}
+          onSaveApiKey={handleSaveApiKey}
+          providerKeys={providerKeys}
+          onSaveProviderKeys={handleSaveProviderKeys}
+        />
+      )}
 
-      <TelegramModal
-        isOpen={isTelegramModalOpen}
-        onClose={() => setIsTelegramModalOpen(false)}
-        agent={telegramAgent}
-        apiKey={apiKey}
-        onSaveTelegramConfig={handleSaveTelegramConfig}
-      />
+      {telegramAgent && (
+        <TelegramModal
+          key={telegramAgent.id}
+          onClose={() => setTelegramAgent(null)}
+          agent={telegramAgent}
+          apiKey={apiKey}
+          providerKeys={providerKeys}
+          onSaveTelegramConfig={handleSaveTelegramConfig}
+        />
+      )}
     </div>
   );
 }

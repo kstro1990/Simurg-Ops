@@ -1,27 +1,33 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { runAgentEngine } from '@/lib/agentEngine';
-import { AgentConfig } from '@/types/agent';
+import { runProviderBridge } from '@/lib/providerBridge';
+import { getStoredSettings } from '@/lib/serverStorage';
+import { AgentConfig, ProviderKeys } from '@/types/agent';
 
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const { agent, prompt, apiKey } = body as {
+    const { agent, prompt, apiKey, providerKeys } = body as {
       agent: AgentConfig;
       prompt: string;
       apiKey?: string;
+      providerKeys?: ProviderKeys;
     };
 
     if (!agent || !prompt) {
-      return NextResponse.json(
-        { error: 'Agente y prompt son requeridos.' },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: 'Agente y prompt son requeridos.' }, { status: 400 });
     }
+
+    const storedKeys = await getStoredSettings();
 
     const result = await runAgentEngine({
       agent,
       userPrompt: prompt,
       apiKey,
+      providerKeys: { ...storedKeys, ...(providerKeys || {}) },
+      // En el servidor se invoca el puente directamente: un fetch relativo no
+      // resolvería y la ejecución caería silenciosamente al simulador.
+      bridgeFn: runProviderBridge,
     });
 
     return NextResponse.json({
@@ -30,9 +36,9 @@ export async function POST(req: NextRequest) {
       agentName: agent.name,
       result,
     });
-  } catch (err: any) {
+  } catch (err) {
     return NextResponse.json(
-      { error: err?.message || 'Error en la ejecución del agente.' },
+      { error: err instanceof Error ? err.message : 'Error en la ejecución del agente.' },
       { status: 500 }
     );
   }

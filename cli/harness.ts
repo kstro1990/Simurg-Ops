@@ -16,7 +16,6 @@ import * as fs from 'fs';
 import { AgentConfig, ProviderKeys, getProviderFromModel } from '@/types/agent';
 import { runAgentEngine } from '@/lib/agentEngine';
 import { DEFAULT_AGENTS } from '@/lib/presets';
-import { GoogleGenAI } from '@google/genai';
 import { directBridge } from './cliEngine';
 import {
   printBanner,
@@ -137,9 +136,9 @@ async function executeAgent(agent: AgentConfig, userPrompt: string): Promise<voi
     // Print metrics
     printMetrics(result.metrics);
 
-  } catch (err: any) {
+  } catch (err) {
     spinner.stop();
-    printError(err.message || String(err));
+    printError(err instanceof Error ? err.message : String(err));
   }
 }
 
