@@ -2,12 +2,51 @@ import { AgentConfig, ThoughtStep, ExecutionMetrics, ProviderKeys, getProviderFr
 import { TOOLS } from './tools';
 import { GoogleGenAI } from '@google/genai';
 
+export interface BridgeRequest {
+  provider: string;
+  model: string;
+  systemPrompt: string;
+  userPrompt: string;
+  temperature: number;
+  maxTokens: number;
+  keys: ProviderKeys;
+}
+
+export interface BridgeResponse {
+  success: boolean;
+  output?: string;
+  source?: string;
+  usage?: { promptTokens?: number; completionTokens?: number };
+  message?: string;
+  error?: string;
+}
+
+export type BridgeFn = (request: BridgeRequest) => Promise<BridgeResponse>;
+
+/**
+ * Default bridge function — calls the Next.js API route (web mode).
+ * In CLI mode, a different bridge function is injected.
+ */
+export async function webBridge(request: BridgeRequest): Promise<BridgeResponse> {
+  const res = await fetch('/api/cli-bridge', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(request),
+  });
+  if (res.ok) {
+    return await res.json();
+  }
+  const errData = await res.json().catch(() => ({}));
+  return { success: false, message: errData?.message || `Bridge error ${res.status}` };
+}
+
 export interface ExecuteAgentOptions {
   agent: AgentConfig;
   userPrompt: string;
   apiKey?: string;
   providerKeys?: ProviderKeys;
   onStepUpdate?: (step: ThoughtStep) => void;
+  bridgeFn?: BridgeFn;
 }
 
 export interface AgentExecutionResult {
@@ -171,52 +210,45 @@ export async function runAgentEngine(options: ExecuteAgentOptions): Promise<Agen
         content: `Conectando con el puente servidor CLI/API de ${provider}...`,
       });
 
-      const res = await fetch('/api/cli-bridge', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          provider,
-          model: agent.model,
-          systemPrompt: agent.systemPrompt,
-          userPrompt: promptWithTools,
-          temperature: agent.temperature,
-          maxTokens: agent.maxTokens,
-          keys: providerKeys || {},
-        }),
+      const bridge = options.bridgeFn || webBridge;
+      const bridgeResult = await bridge({
+        provider,
+        model: agent.model,
+        systemPrompt: agent.systemPrompt,
+        userPrompt: promptWithTools,
+        temperature: agent.temperature,
+        maxTokens: agent.maxTokens,
+        keys: providerKeys || {},
       });
 
-      if (res.ok) {
-        const data = await res.json();
-        if (data.success && data.output) {
-          const latencyMs = Date.now() - startTime;
+      if (bridgeResult.success && bridgeResult.output) {
+        const latencyMs = Date.now() - startTime;
 
-          addStep({
-            type: 'thought',
-            content: `Respuesta recibida exitosamente desde ${data.source === 'cli_binary' ? 'Binario CLI Local' : 'API Remota'} (${provider}).`,
-          });
+        addStep({
+          type: 'thought',
+          content: `Respuesta recibida exitosamente desde ${bridgeResult.source === 'cli_binary' ? 'Binario CLI Local' : 'API Remota'} (${provider}).`,
+        });
 
-          addStep({
-            type: 'output',
-            content: data.output,
-          });
+        addStep({
+          type: 'output',
+          content: bridgeResult.output,
+        });
 
-          return {
-            steps,
-            finalOutput: data.output,
-            metrics: {
-              promptTokens: data.usage?.promptTokens || Math.floor(userPrompt.length / 4) + 120,
-              completionTokens: data.usage?.completionTokens || Math.floor(data.output.length / 4),
-              totalTokens: (data.usage?.promptTokens || Math.floor(userPrompt.length / 4)) + (data.usage?.completionTokens || Math.floor(data.output.length / 4)) + 120,
-              latencyMs,
-            },
-          };
-        }
+        return {
+          steps,
+          finalOutput: bridgeResult.output,
+          metrics: {
+            promptTokens: bridgeResult.usage?.promptTokens || Math.floor(userPrompt.length / 4) + 120,
+            completionTokens: bridgeResult.usage?.completionTokens || Math.floor(bridgeResult.output.length / 4),
+            totalTokens: (bridgeResult.usage?.promptTokens || Math.floor(userPrompt.length / 4)) + (bridgeResult.usage?.completionTokens || Math.floor(bridgeResult.output.length / 4)) + 120,
+            latencyMs,
+          },
+        };
       }
 
-      const errData = await res.json().catch(() => ({}));
       addStep({
         type: 'error',
-        content: `[${provider.toUpperCase()} Bridge Notice]: ${errData?.message || 'No se detectó API Key ni binario CLI local'}. Conmutando a modo de simulación avanzada para ${provider}...`,
+        content: `[${provider.toUpperCase()} Bridge Notice]: ${bridgeResult?.message || 'No se detectó API Key ni binario CLI local'}. Conmutando a modo de simulación avanzada para ${provider}...`,
       });
     } catch (err: any) {
       addStep({

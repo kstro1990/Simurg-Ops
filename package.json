@@ -6,7 +6,10 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "cli": "npx tsx cli/harness.ts",
+    "cli:help": "npx tsx cli/harness.ts --help",
+    "cli:list": "npx tsx cli/harness.ts --list"
   },
   "dependencies": {
     "@google/genai": "^2.15.0",
@@ -23,6 +26,7 @@
     "eslint": "^9",
     "eslint-config-next": "16.2.12",
     "tailwindcss": "^4",
+    "tsx": "^4",
     "typescript": "^5"
   }
 }
