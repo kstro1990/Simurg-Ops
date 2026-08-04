@@ -23,19 +23,13 @@ export async function getStoredAgents(): Promise<AgentConfig[]> {
   try {
     const data = await fs.readFile(AGENTS_FILE, 'utf-8');
     const parsed = JSON.parse(data);
-    if (Array.isArray(parsed) && parsed.length > 0) {
-      const existingIds = new Set(parsed.map((a: AgentConfig) => a.id));
-      const missingDefaults = DEFAULT_AGENTS.filter((def) => !existingIds.has(def.id));
-      if (missingDefaults.length > 0) {
-        const merged = [...parsed, ...missingDefaults];
-        await saveStoredAgents(merged);
-        return merged;
-      }
+    if (Array.isArray(parsed)) {
       return parsed;
     }
   } catch (err) {
-    // File doesn't exist or corrupt, seed defaults
+    // File doesn't exist or corrupt, seed defaults on first startup
     await saveStoredAgents(DEFAULT_AGENTS);
+    return DEFAULT_AGENTS;
   }
   return DEFAULT_AGENTS;
 }

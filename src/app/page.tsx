@@ -37,6 +37,7 @@ export default function Home() {
   useEffect(() => {
     async function loadInitialData() {
       // 1. Settings & Keys
+      let serverSettingsLoaded = false;
       try {
         const resSettings = await fetch('/api/settings');
         if (resSettings.ok) {
@@ -46,24 +47,28 @@ export default function Home() {
             if (dataSettings.settings.geminiApiKey) {
               setApiKey(dataSettings.settings.geminiApiKey);
             }
+            localStorage.setItem('aether_provider_keys', JSON.stringify(dataSettings.settings));
+            serverSettingsLoaded = true;
           }
         }
       } catch (err) {
         console.error('Error fetching server settings:', err);
       }
 
-      // Fallback local key check
-      const storedKey = localStorage.getItem('aether_gemini_api_key');
-      if (storedKey && !apiKey) setApiKey(storedKey);
-      const storedProviderKeys = localStorage.getItem('aether_provider_keys');
-      if (storedProviderKeys) {
-        try {
-          const parsedPk = JSON.parse(storedProviderKeys);
-          setProviderKeys((prev) => ({ ...prev, ...parsedPk }));
-        } catch {}
+      if (!serverSettingsLoaded) {
+        const storedKey = localStorage.getItem('aether_gemini_api_key');
+        if (storedKey && !apiKey) setApiKey(storedKey);
+        const storedProviderKeys = localStorage.getItem('aether_provider_keys');
+        if (storedProviderKeys) {
+          try {
+            const parsedPk = JSON.parse(storedProviderKeys);
+            setProviderKeys((prev) => ({ ...prev, ...parsedPk }));
+          } catch {}
+        }
       }
 
       // 2. Agents
+      let serverAgentsLoaded = false;
       try {
         const resAgents = await fetch('/api/agents');
         if (resAgents.ok) {
@@ -71,38 +76,53 @@ export default function Home() {
           if (dataAgents.success && Array.isArray(dataAgents.agents) && dataAgents.agents.length > 0) {
             setAgents(dataAgents.agents);
             setSelectedAgent(dataAgents.agents[0]);
+            localStorage.setItem('aether_agents', JSON.stringify(dataAgents.agents));
+            serverAgentsLoaded = true;
           }
         }
       } catch (err) {
         console.error('Error fetching server agents:', err);
       }
 
-      // Fallback local agents check
-      const storedAgents = localStorage.getItem('aether_agents');
-      if (storedAgents) {
-        try {
-          const parsed = JSON.parse(storedAgents);
-          if (Array.isArray(parsed) && parsed.length > 0) {
-            const existingIds = new Set(parsed.map((a: AgentConfig) => a.id));
-            const missingDefaults = DEFAULT_AGENTS.filter((def) => !existingIds.has(def.id));
-            const merged = [...parsed, ...missingDefaults];
-            setAgents(merged);
-            setSelectedAgent(merged[0]);
-          }
-        } catch {}
+      if (!serverAgentsLoaded) {
+        const storedAgents = localStorage.getItem('aether_agents');
+        if (storedAgents) {
+          try {
+            const parsed = JSON.parse(storedAgents);
+            if (Array.isArray(parsed) && parsed.length > 0) {
+              setAgents(parsed);
+              setSelectedAgent(parsed[0]);
+            }
+          } catch {}
+        }
       }
 
       // 3. Workflows
+      let serverWorkflowsLoaded = false;
       try {
         const resWf = await fetch('/api/workflows');
         if (resWf.ok) {
           const dataWf = await resWf.json();
           if (dataWf.success && Array.isArray(dataWf.workflows) && dataWf.workflows.length > 0) {
             setWorkflows(dataWf.workflows);
+            localStorage.setItem('aether_workflows', JSON.stringify(dataWf.workflows));
+            serverWorkflowsLoaded = true;
           }
         }
       } catch (err) {
         console.error('Error fetching server workflows:', err);
+      }
+
+      if (!serverWorkflowsLoaded) {
+        const storedWorkflows = localStorage.getItem('aether_workflows');
+        if (storedWorkflows) {
+          try {
+            const parsedWf = JSON.parse(storedWorkflows);
+            if (Array.isArray(parsedWf) && parsedWf.length > 0) {
+              setWorkflows(parsedWf);
+            }
+          } catch {}
+        }
       }
 
       // 4. History
@@ -112,6 +132,7 @@ export default function Home() {
           const dataHist = await resHist.json();
           if (dataHist.success && Array.isArray(dataHist.history)) {
             setRunsHistory(dataHist.history);
+            localStorage.setItem('aether_history', JSON.stringify(dataHist.history));
           }
         }
       } catch (err) {
