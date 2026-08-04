@@ -33,53 +33,93 @@ export default function Home() {
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedCategory, setSelectedCategory] = useState<string>('all');
 
-  // Load state from localStorage on mount
+  // Load state from server APIs with localStorage fallback on mount
   useEffect(() => {
-    try {
-      const storedKey = localStorage.getItem('aether_gemini_api_key');
-      if (storedKey) setApiKey(storedKey);
+    async function loadInitialData() {
+      // 1. Settings & Keys
+      try {
+        const resSettings = await fetch('/api/settings');
+        if (resSettings.ok) {
+          const dataSettings = await resSettings.json();
+          if (dataSettings.success && dataSettings.settings) {
+            setProviderKeys(dataSettings.settings);
+            if (dataSettings.settings.geminiApiKey) {
+              setApiKey(dataSettings.settings.geminiApiKey);
+            }
+          }
+        }
+      } catch (err) {
+        console.error('Error fetching server settings:', err);
+      }
 
+      // Fallback local key check
+      const storedKey = localStorage.getItem('aether_gemini_api_key');
+      if (storedKey && !apiKey) setApiKey(storedKey);
       const storedProviderKeys = localStorage.getItem('aether_provider_keys');
       if (storedProviderKeys) {
         try {
           const parsedPk = JSON.parse(storedProviderKeys);
-          setProviderKeys(parsedPk);
+          setProviderKeys((prev) => ({ ...prev, ...parsedPk }));
         } catch {}
-      } else if (storedKey) {
-        setProviderKeys({ geminiApiKey: storedKey });
       }
 
-      const storedAgents = localStorage.getItem('aether_agents');
-      if (storedAgents) {
-        const parsed = JSON.parse(storedAgents);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          const existingIds = new Set(parsed.map((a: AgentConfig) => a.id));
-          const missingDefaults = DEFAULT_AGENTS.filter((def) => !existingIds.has(def.id));
-          const merged = [...parsed, ...missingDefaults];
-          setAgents(merged);
-          setSelectedAgent(merged[0]);
-          if (missingDefaults.length > 0) {
-            localStorage.setItem('aether_agents', JSON.stringify(merged));
+      // 2. Agents
+      try {
+        const resAgents = await fetch('/api/agents');
+        if (resAgents.ok) {
+          const dataAgents = await resAgents.json();
+          if (dataAgents.success && Array.isArray(dataAgents.agents) && dataAgents.agents.length > 0) {
+            setAgents(dataAgents.agents);
+            setSelectedAgent(dataAgents.agents[0]);
           }
         }
+      } catch (err) {
+        console.error('Error fetching server agents:', err);
       }
 
-      const storedWorkflows = localStorage.getItem('aether_workflows');
-      if (storedWorkflows) {
-        const parsedWf = JSON.parse(storedWorkflows);
-        if (Array.isArray(parsedWf) && parsedWf.length > 0) {
-          setWorkflows(parsedWf);
+      // Fallback local agents check
+      const storedAgents = localStorage.getItem('aether_agents');
+      if (storedAgents) {
+        try {
+          const parsed = JSON.parse(storedAgents);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            const existingIds = new Set(parsed.map((a: AgentConfig) => a.id));
+            const missingDefaults = DEFAULT_AGENTS.filter((def) => !existingIds.has(def.id));
+            const merged = [...parsed, ...missingDefaults];
+            setAgents(merged);
+            setSelectedAgent(merged[0]);
+          }
+        } catch {}
+      }
+
+      // 3. Workflows
+      try {
+        const resWf = await fetch('/api/workflows');
+        if (resWf.ok) {
+          const dataWf = await resWf.json();
+          if (dataWf.success && Array.isArray(dataWf.workflows) && dataWf.workflows.length > 0) {
+            setWorkflows(dataWf.workflows);
+          }
         }
+      } catch (err) {
+        console.error('Error fetching server workflows:', err);
       }
 
-      const storedHistory = localStorage.getItem('aether_history');
-      if (storedHistory) {
-        const parsedHist = JSON.parse(storedHistory);
-        if (Array.isArray(parsedHist)) setRunsHistory(parsedHist);
+      // 4. History
+      try {
+        const resHist = await fetch('/api/history');
+        if (resHist.ok) {
+          const dataHist = await resHist.json();
+          if (dataHist.success && Array.isArray(dataHist.history)) {
+            setRunsHistory(dataHist.history);
+          }
+        }
+      } catch (err) {
+        console.error('Error fetching server history:', err);
       }
-    } catch (e) {
-      console.error('Error reading localStorage', e);
     }
+
+    loadInitialData();
   }, []);
 
   const [telegramOffsets, setTelegramOffsets] = useState<Record<string, number>>({});
@@ -131,15 +171,37 @@ export default function Home() {
     return () => clearInterval(intervalId);
   }, [agents, apiKey, telegramOffsets]);
 
-  // Save changes to localStorage
-  const saveAgentsToStorage = (newAgents: AgentConfig[]) => {
+  // Save changes to Server API & localStorage
+  const saveAgentsToStorage = async (newAgents: AgentConfig[]) => {
     setAgents(newAgents);
     localStorage.setItem('aether_agents', JSON.stringify(newAgents));
+    try {
+      await fetch('/api/agents', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(newAgents),
+      });
+    } catch (err) {
+      console.error('Error saving agents to server:', err);
+    }
   };
 
   const handleSaveApiKey = (key: string) => {
     setApiKey(key);
     localStorage.setItem('aether_gemini_api_key', key);
+    saveStoredKeysToServer({ ...providerKeys, geminiApiKey: key });
+  };
+
+  const saveStoredKeysToServer = async (keys: ProviderKeys) => {
+    try {
+      await fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(keys),
+      });
+    } catch (err) {
+      console.error('Error saving settings to server:', err);
+    }
   };
 
   const handleSaveProviderKeys = (keys: ProviderKeys) => {
@@ -149,6 +211,7 @@ export default function Home() {
       setApiKey(keys.geminiApiKey);
       localStorage.setItem('aether_gemini_api_key', keys.geminiApiKey);
     }
+    saveStoredKeysToServer(keys);
   };
 
   const handleSaveAgent = (agentToSave: AgentConfig) => {
@@ -177,11 +240,17 @@ export default function Home() {
     saveAgentsToStorage(updated);
   };
 
-  const handleDeleteAgent = (agentId: string) => {
+  const handleDeleteAgent = async (agentId: string) => {
     const updated = agents.filter((a) => a.id !== agentId);
-    saveAgentsToStorage(updated);
+    setAgents(updated);
+    localStorage.setItem('aether_agents', JSON.stringify(updated));
     if (selectedAgent?.id === agentId) {
       setSelectedAgent(updated[0] || null);
+    }
+    try {
+      await fetch(`/api/agents?id=${agentId}`, { method: 'DELETE' });
+    } catch (err) {
+      console.error('Error deleting agent on server:', err);
     }
   };
 
@@ -198,21 +267,44 @@ export default function Home() {
     setSelectedAgent(cloned);
   };
 
-  const handleSaveWorkflow = (newWf: WorkflowConfig) => {
+  const handleSaveWorkflow = async (newWf: WorkflowConfig) => {
     const updated = [newWf, ...workflows];
     setWorkflows(updated);
     localStorage.setItem('aether_workflows', JSON.stringify(updated));
+    try {
+      await fetch('/api/workflows', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(newWf),
+      });
+    } catch (err) {
+      console.error('Error saving workflow to server:', err);
+    }
   };
 
-  const handleSaveRunHistory = (newRun: ExecutionRun) => {
+  const handleSaveRunHistory = async (newRun: ExecutionRun) => {
     const updated = [newRun, ...runsHistory];
     setRunsHistory(updated);
     localStorage.setItem('aether_history', JSON.stringify(updated));
+    try {
+      await fetch('/api/history', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(newRun),
+      });
+    } catch (err) {
+      console.error('Error saving history run to server:', err);
+    }
   };
 
-  const handleClearHistory = () => {
+  const handleClearHistory = async () => {
     setRunsHistory([]);
     localStorage.removeItem('aether_history');
+    try {
+      await fetch('/api/history', { method: 'DELETE' });
+    } catch (err) {
+      console.error('Error clearing history on server:', err);
+    }
   };
 
   const handleRunAgent = (agent: AgentConfig) => {
