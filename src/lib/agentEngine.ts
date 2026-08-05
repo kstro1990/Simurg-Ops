@@ -7,6 +7,7 @@ import {
   getProviderFromModel,
 } from '@/types/agent';
 import { BridgeFn } from '@/types/bridge';
+import { McpFn } from '@/types/mcp';
 import { TOOLS } from './tools';
 import { GoogleGenAI } from '@google/genai';
 
@@ -28,6 +29,16 @@ export interface ExecuteAgentOptions {
    * y las rutas /execute cayeran siempre al simulador sin avisar.
    */
   bridgeFn?: BridgeFn;
+  /**
+   * Transporte hacia los servidores MCP del agente, con el mismo criterio que
+   * `bridgeFn`: sin default, porque la implementación real usa child_process.
+   * - Servidor y CLI: `runMcpBridge` (lib/mcpClient.ts).
+   * - Navegador: `fetchMcpBridge` (lib/mcpBridgeClient.ts).
+   *
+   * A diferencia de `bridgeFn`, omitirlo no aborta la ejecución: MCP es
+   * contexto opcional, el proveedor no.
+   */
+  mcpFn?: McpFn;
 }
 
 export interface AgentExecutionResult {
@@ -56,7 +67,7 @@ function errorMessage(err: unknown): string {
 }
 
 export async function runAgentEngine(options: ExecuteAgentOptions): Promise<AgentExecutionResult> {
-  const { agent, userPrompt, apiKey, providerKeys, onStepUpdate, bridgeFn } = options;
+  const { agent, userPrompt, apiKey, providerKeys, onStepUpdate, bridgeFn, mcpFn } = options;
   const startTime = Date.now();
   const steps: ThoughtStep[] = [];
   const strictMode = Boolean(providerKeys?.strictMode);
@@ -78,8 +89,15 @@ export async function runAgentEngine(options: ExecuteAgentOptions): Promise<Agen
   /** Motivos por los que cada ruta real falló, para el mensaje del modo estricto. */
   const failures: string[] = [];
 
-  /** Ejecuta las herramientas del agente y devuelve el contexto recopilado. */
-  const runTools = async (): Promise<string> => {
+  /**
+   * El contexto de herramientas se calcula una sola vez por ejecución. Antes se
+   * recalculaba en el fallback al simulador, lo que con MCP significaría lanzar
+   * procesos y pegar a APIs remotas dos veces por cada petición.
+   */
+  let toolContextCache: string | null = null;
+
+  /** Herramientas locales de `lib/tools.ts` (registro cerrado). */
+  const runLocalTools = async (): Promise<string> => {
     if (!agent.tools || agent.tools.length === 0) return '';
 
     addStep({
@@ -114,6 +132,77 @@ export async function runAgentEngine(options: ExecuteAgentOptions): Promise<Agen
 
       context += `\n\n[CONTEXT FROM TOOL: ${toolDef.displayName}]:\n${toolResult}`;
     }
+    return context;
+  };
+
+  /**
+   * Servidores MCP del agente. Son enriquecedores pre-flight, igual que las
+   * herramientas locales: se invocan las tools que el usuario declaró y su
+   * salida se anexa al prompt. Un servidor caído degrada el contexto, nunca
+   * tumba la ejecución.
+   *
+   * `ThoughtStep.toolName` está tipado como `ToolName` (registro local), así que
+   * los pasos MCP lo dejan sin definir y llevan la identidad en `content` y
+   * `toolArgs`.
+   */
+  const runMcpServers = async (): Promise<string> => {
+    const servers = (agent.mcpServers ?? []).filter(
+      (server) => server.enabled && server.calls?.length > 0
+    );
+    if (servers.length === 0) return '';
+
+    if (!mcpFn) {
+      const detail =
+        'Hay servidores MCP habilitados pero no se proporcionó transporte (mcpFn). Es un error de integración; la ejecución continúa sin contexto MCP.';
+      failures.push(detail);
+      addStep({ type: 'error', content: `[MCP]: ${detail}` });
+      return '';
+    }
+
+    addStep({
+      type: 'thought',
+      content: `Servidores MCP habilitados: ${servers.map((s) => s.name || s.id).join(', ')}. Recopilando contexto...`,
+    });
+
+    let context = '';
+    for (const server of servers) {
+      const label = server.name || server.id;
+      for (const call of server.calls) {
+        addStep({
+          type: 'tool_call',
+          content: `Invocando MCP [${label}] → ${call.toolName}...`,
+          toolArgs: {
+            mcpServer: label,
+            mcpTransport: server.transport,
+            mcpTool: call.toolName,
+            arguments: call.arguments ?? {},
+          },
+        });
+
+        const result = await mcpFn({ server, call, userPrompt });
+
+        if (result.success && result.output) {
+          addStep({
+            type: 'tool_result',
+            content: `Resultado obtenido de MCP [${label}] → ${call.toolName}`,
+            toolResult: result.output,
+          });
+          context += `\n\n[CONTEXT FROM MCP: ${label} / ${call.toolName}]:\n${result.output}`;
+        } else {
+          const detail = result.message || `MCP [${label}] → ${call.toolName} no devolvió salida.`;
+          failures.push(detail);
+          addStep({ type: 'error', content: detail });
+        }
+      }
+    }
+    return context;
+  };
+
+  /** Ejecuta las herramientas del agente y devuelve el contexto recopilado. */
+  const runTools = async (): Promise<string> => {
+    if (toolContextCache !== null) return toolContextCache;
+    const context = (await runLocalTools()) + (await runMcpServers());
+    toolContextCache = context;
     return context;
   };
 

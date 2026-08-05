@@ -2,8 +2,10 @@
 
 import React, { useState } from 'react';
 import { AgentConfig, AgentModel, DEFAULT_MODEL, ToolName } from '@/types/agent';
+import { McpServerConfig } from '@/types/mcp';
 import { X, Wrench, Cpu, Check } from 'lucide-react';
 import { TOOLS } from '@/lib/tools';
+import { McpServerEditor } from './McpServerEditor';
 
 interface AgentModalProps {
   onClose: () => void;
@@ -72,6 +74,7 @@ export const AgentModal: React.FC<AgentModalProps> = ({ onClose, onSave, initial
   const [selectedTools, setSelectedTools] = useState<ToolName[]>(
     initialAgent?.tools ?? DEFAULT_TOOLS
   );
+  const [mcpServers, setMcpServers] = useState<McpServerConfig[]>(initialAgent?.mcpServers ?? []);
 
   const toggleTool = (toolName: ToolName) => {
     setSelectedTools((prev) =>
@@ -101,6 +104,7 @@ export const AgentModal: React.FC<AgentModalProps> = ({ onClose, onSave, initial
       temperature,
       maxTokens: safeMaxTokens,
       tools: selectedTools,
+      mcpServers,
       // Este modal no edita el enrolamiento de Telegram: hay que arrastrarlo,
       // o guardar un agente enrolado lo desenrolaría sin avisar.
       telegramConfig: initialAgent?.telegramConfig,
@@ -313,6 +317,10 @@ export const AgentModal: React.FC<AgentModalProps> = ({ onClose, onSave, initial
                 );
               })}
             </div>
+          </div>
+
+          <div className="pt-2 border-t border-white/10">
+            <McpServerEditor servers={mcpServers} onChange={setMcpServers} />
           </div>
 
           <div className="grid grid-cols-2 gap-4 pt-2 border-t border-white/10">

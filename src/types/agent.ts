@@ -1,3 +1,5 @@
+import type { McpServerConfig } from './mcp';
+
 export type AIProvider = 'gemini' | 'claude-code' | 'anthropic' | 'copilot-cli' | 'openai';
 
 /**
@@ -124,6 +126,8 @@ export interface AgentConfig {
   temperature: number;
   maxTokens: number;
   tools: ToolName[];
+  /** Servidores MCP propios de este agente. Ver types/mcp.ts. */
+  mcpServers?: McpServerConfig[];
   telegramConfig?: TelegramConfig;
   isCustom?: boolean;
   createdAt: string;

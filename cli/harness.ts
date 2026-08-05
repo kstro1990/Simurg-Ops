@@ -17,7 +17,7 @@ import { execFileSync } from 'child_process';
 import { AgentConfig, ProviderKeys, getProviderFromModel } from '@/types/agent';
 import { runAgentEngine } from '@/lib/agentEngine';
 import { DEFAULT_AGENTS } from '@/lib/presets';
-import { directBridge } from './cliEngine';
+import { directBridge, directMcp } from './cliEngine';
 import {
   printBanner,
   printHelp,
@@ -127,6 +127,7 @@ async function executeAgent(agent: AgentConfig, userPrompt: string): Promise<voi
       apiKey: providerKeys.geminiApiKey,
       providerKeys,
       bridgeFn: directBridge,
+      mcpFn: directMcp,
       onStepUpdate: (step) => {
         spinner.stop();
         printStep(step.type, step.content, step.toolName);

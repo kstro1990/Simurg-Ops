@@ -96,6 +96,32 @@ Each agent carries its own `telegramConfig` (one agent ↔ one bot). Enrolment r
 
 `src/lib/tools.ts` are pre-flight prompt enrichers, not model-driven tool calls: every tool on an agent runs unconditionally before generation and its JSON output is appended to the prompt. Each definition carries a `simulated` flag — `web_search`, `image_generator`, and `data_extractor` return labelled placeholder data. `code_executor` really runs JavaScript via `new Function`, **in-process and unsandboxed**; it only executes when an explicit `code` argument is supplied.
 
+`runTools()` in `agentEngine.ts` memoizes its result. It used to run once on the real-provider path and again in the simulator fallback — harmless for the placeholder tools, but with MCP that meant spawning processes and hitting remote APIs twice per request.
+
+### MCP: one server set per agent
+
+Each agent carries its own `mcpServers: McpServerConfig[]` (`src/types/mcp.ts`), edited in `McpServerEditor` inside `AgentModal` — same one-agent-one-config shape as `telegramConfig`.
+
+**MCP tools are pre-flight enrichers too, not model-driven tool calls.** The model never sees a tool schema and cannot choose or iterate: the user declares which tools to invoke and with what arguments, they all run before generation, and their output is appended as `[CONTEXT FROM MCP: <server> / <tool>]`. A real agentic loop was rejected because `copilot-cli` and `claude-code` are one-shot CLI calls with no tool-call channel.
+
+- Arguments are static JSON. `{{prompt}}` is interpolated with the user's prompt anywhere in a string value, including nested — it's the only way a call can depend on the request. See `interpolateArgs()`.
+- Both transports are supported. **stdio** spawns a local binary (`StdioClientTransport`, env filtered through `getDefaultEnvironment()` plus the user's own vars). **http** tries Streamable HTTP and retries with SSE; the error reported is always the *first* transport's, because otherwise a 401 surfaces as the 404 the SSE `GET` gets back.
+- One connection per call — `connect` → call → `close`. No pool: it matches the one-shot model of the rest of the harness and avoids orphaned child processes between Next requests.
+- A failing MCP server degrades context; it never aborts the run. That's the one place MCP differs from `bridgeFn`: a missing `mcpFn` is logged as an integration error and execution continues.
+- **stdio runs an arbitrary local binary with full disk and network access.** Whoever can edit an agent can execute code on the host. `env` and `headers` (MCP tokens) are stored in cleartext in `data/agents.json`.
+
+Same bridge indirection as providers — `mcpFn` is injected, never imported from the engine, because `mcpClient.ts` uses `child_process`:
+
+| Caller | `mcpFn` |
+|---|---|
+| Browser | `fetchMcpBridge` (`src/lib/mcpBridgeClient.ts`) → `/api/mcp/call` |
+| Server routes, `telegramService` | `runMcpBridge` (`src/lib/mcpClient.ts`) |
+| `cli/harness.ts` | `directMcp` (`cli/cliEngine.ts`) |
+
+`/api/mcp/tools` lists a server's tools; it backs the modal's "Probar conexión" button so the user picks from the real catalog instead of typing names blind.
+
+`ThoughtStep.toolName` is typed to the local `ToolName` union, so MCP steps leave it undefined and carry their identity in `toolArgs` (`mcpServer`, `mcpTool`); `ExecutionPanel` labels them via `mcpStepLabel()`.
+
 ### Workflows
 
 `WorkflowConfig` is a linear chain: each step's `finalOutput` becomes the next step's prompt, prefixed by that step's optional `customInstruction`. `WorkflowBuilder` runs the chain client-side and writes each step to history; `/api/workflows/execute` implements the same pipeline server-side for programmatic callers. No branching, no parallelism.
