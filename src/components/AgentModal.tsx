@@ -42,8 +42,15 @@ const ANTHROPIC_MODELS: ModelOption[] = [
 ];
 
 const OPENAI_MODELS: ModelOption[] = [
-  { id: 'copilot-cli', label: 'Copilot CLI', desc: 'Sugerencias de comandos (gh copilot)' },
-  { id: 'copilot-gpt-4o', label: 'Copilot GPT-4o', desc: 'Asistente de código GitHub' },
+  // Elegir modelo explícito requiere un plan de Copilot que lo permita; en los
+  // planes restringidos sólo funciona el modo automático.
+  { id: 'copilot-cli', label: 'Copilot (automático)', desc: 'El CLI elige el modelo — compatible con todos los planes' },
+  { id: 'copilot-claude-opus-5', label: 'Copilot · Claude Opus 5', desc: 'Máxima capacidad (según plan)' },
+  { id: 'copilot-claude-sonnet-5', label: 'Copilot · Claude Sonnet 5', desc: 'Equilibrio velocidad/calidad (según plan)' },
+  { id: 'copilot-claude-haiku-4.5', label: 'Copilot · Claude Haiku 4.5', desc: 'Ultra rápido y económico (según plan)' },
+  { id: 'copilot-gpt-5.5', label: 'Copilot · GPT-5.5', desc: 'Razonamiento general (según plan)' },
+  { id: 'copilot-gpt-5-mini', label: 'Copilot · GPT-5 Mini', desc: 'El más barato (según plan)' },
+  { id: 'copilot-gemini-3.1-pro-preview', label: 'Copilot · Gemini 3.1 Pro', desc: 'Contexto largo, preview (según plan)' },
   { id: 'gpt-4o', label: 'OpenAI GPT-4o', desc: 'Multimodal de alta precisión' },
   { id: 'gpt-4o-mini', label: 'OpenAI GPT-4o Mini', desc: 'Económico y rápido' },
 ];

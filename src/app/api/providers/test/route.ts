@@ -9,7 +9,9 @@ const PROBE_MODEL: Record<AIProvider, AgentModel> = {
   gemini: 'gemini-3.5-flash-lite',
   anthropic: 'claude-haiku-4-5',
   'claude-code': 'claude-haiku-4-5',
-  'copilot-cli': 'gpt-4o-mini',
+  // Modo automático a propósito: `--model` explícito falla en los planes de
+  // Copilot que no permiten elegir modelo, y esto solo comprueba la conexión.
+  'copilot-cli': 'copilot-cli',
   openai: 'gpt-4o-mini',
 };
 

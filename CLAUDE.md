@@ -65,6 +65,15 @@ Never treat a `simulated` run as model output.
 
 `normalizeModel()` remaps retired IDs on load, and `getStoredAgents()` persists the migration so stored agents keep working.
 
+### Copilot goes through its own CLI — never through OpenAI
+
+`copilot-*` models are **not** an OpenAI-compatible endpoint. There is no HTTP API here: `callCopilotCli()` shells out to the local `copilot` binary in non-interactive mode (`--prompt … --output-format json`) and the session lives inside that binary (`copilot login`). The earlier code sent `GITHUB_TOKEN` to `api.openai.com` as if it were an OpenAI key, which is always a 401 — that route never worked. `copilotToken` is now optional and injected as `COPILOT_GITHUB_TOKEN`, for hosts with no interactive login.
+
+- Output is JSONL: only `assistant.message` carries the answer. `assistant.message_delta` events are the streaming view of that same text — summing both duplicates the response.
+- `--allow-all-tools` is **deliberately not passed**. The CLI is a full agent with shell and disk access; a harness that only wants text must not grant that. Denied tools still yield a text answer.
+- `temperature` / `maxTokens` have no CLI equivalent and are ignored.
+- Explicit `--model` requires a Copilot plan that permits model choice. On restricted plans every named model is rejected and only `copilot-cli` (auto mode) works — the bridge detects that and says so rather than failing opaquely. `copilot help config` lists the global catalog, not your entitlements.
+
 ### Persistence: `data/*.json`
 
 `src/lib/serverStorage.ts` owns all reads and writes. `data/` is **gitignored** — it holds bot tokens and API keys in plaintext.

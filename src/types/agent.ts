@@ -16,7 +16,12 @@ export type AgentModel =
   | 'claude-sonnet-5'
   | 'claude-haiku-4-5'
   | 'copilot-cli'
-  | 'copilot-gpt-4o'
+  | 'copilot-claude-opus-5'
+  | 'copilot-claude-sonnet-5'
+  | 'copilot-claude-haiku-4.5'
+  | 'copilot-gpt-5.5'
+  | 'copilot-gpt-5-mini'
+  | 'copilot-gemini-3.1-pro-preview'
   | 'gpt-4o'
   | 'gpt-4o-mini';
 
@@ -31,7 +36,12 @@ export const AGENT_MODELS: AgentModel[] = [
   'claude-sonnet-5',
   'claude-haiku-4-5',
   'copilot-cli',
-  'copilot-gpt-4o',
+  'copilot-claude-opus-5',
+  'copilot-claude-sonnet-5',
+  'copilot-claude-haiku-4.5',
+  'copilot-gpt-5.5',
+  'copilot-gpt-5-mini',
+  'copilot-gemini-3.1-pro-preview',
   'gpt-4o',
   'gpt-4o-mini',
 ];
@@ -59,6 +69,9 @@ const LEGACY_MODEL_MAP: Record<string, AgentModel> = {
   'claude-3.7-sonnet': 'claude-sonnet-5',
   'claude-3.5-sonnet': 'claude-sonnet-5',
   'claude-3.5-haiku': 'claude-haiku-4-5',
+  // Copilot: `copilot-gpt-4o` apuntaba a la API de OpenAI con un token de GitHub,
+  // ruta que nunca autenticó. Ahora Copilot va por su propio CLI.
+  'copilot-gpt-4o': 'copilot-cli',
 };
 
 export function normalizeModel(model: string): AgentModel {

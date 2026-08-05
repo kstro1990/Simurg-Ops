@@ -1,4 +1,5 @@
 import { execFile } from 'child_process';
+import { tmpdir } from 'os';
 import { promisify } from 'util';
 import { AgentModel } from '@/types/agent';
 import { BridgeRequest, BridgeResult } from '@/types/bridge';
@@ -34,9 +35,27 @@ const ANTHROPIC_MIN_MAX_TOKENS = 8192;
 const OPENAI_MODEL_MAP: Partial<Record<AgentModel, string>> = {
   'gpt-4o': 'gpt-4o',
   'gpt-4o-mini': 'gpt-4o-mini',
-  'copilot-gpt-4o': 'gpt-4o',
-  'copilot-cli': 'gpt-4o',
 };
+
+/**
+ * IDs que acepta `copilot --model` (ver `copilot help config`). `copilot-cli`
+ * no mapea a ninguno a propósito: sin `--model` el CLI usa su modo automático
+ * y elige el modelo por sí mismo.
+ */
+const COPILOT_MODEL_MAP: Partial<Record<AgentModel, string>> = {
+  'copilot-claude-opus-5': 'claude-opus-5',
+  'copilot-claude-sonnet-5': 'claude-sonnet-5',
+  'copilot-claude-haiku-4.5': 'claude-haiku-4.5',
+  'copilot-gpt-5.5': 'gpt-5.5',
+  'copilot-gpt-5-mini': 'gpt-5-mini',
+  'copilot-gemini-3.1-pro-preview': 'gemini-3.1-pro-preview',
+};
+
+/**
+ * El CLI de Copilot arranca una sesión de agente completa, no un simple
+ * completion: 60 s se quedan cortos en cuanto el prompt es real.
+ */
+const COPILOT_TIMEOUT_MS = 180_000;
 
 function errorMessage(err: unknown): string {
   if (err instanceof Error) return err.message;
@@ -146,6 +165,179 @@ async function callOpenAI(request: BridgeRequest, apiKey: string): Promise<Bridg
   };
 }
 
+interface CopilotEvent {
+  type?: string;
+  data?: {
+    content?: string;
+    outputTokens?: number;
+    message?: string;
+    error?: string;
+  };
+  exitCode?: number;
+  error?: string;
+}
+
+/**
+ * Extrae la respuesta del JSONL de `copilot --output-format json`. El CLI emite
+ * un objeto por línea; sólo `assistant.message` lleva texto final (los
+ * `assistant.message_delta` son el streaming del mismo contenido, así que
+ * sumarlos duplicaría la respuesta).
+ */
+function parseCopilotJsonl(stdout: string): {
+  output: string;
+  outputTokens: number;
+  exitCode?: number;
+  errorText?: string;
+} {
+  let output = '';
+  let outputTokens = 0;
+  let exitCode: number | undefined;
+  let errorText: string | undefined;
+
+  for (const line of stdout.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('{')) continue;
+
+    let event: CopilotEvent;
+    try {
+      event = JSON.parse(trimmed) as CopilotEvent;
+    } catch {
+      continue; // Línea truncada o ruido: no invalida el resto de la sesión.
+    }
+
+    if (event.type === 'assistant.message' && event.data?.content) {
+      output += (output ? '\n\n' : '') + event.data.content;
+      outputTokens += event.data.outputTokens ?? 0;
+    } else if (event.type === 'error' || event.type === 'session.error') {
+      errorText = event.data?.message || event.data?.error || event.error;
+    } else if (event.type === 'result') {
+      exitCode = event.exitCode;
+    }
+  }
+
+  return { output: output.trim(), outputTokens, exitCode, errorText };
+}
+
+/**
+ * Ejecuta el CLI de GitHub Copilot en modo no interactivo.
+ *
+ * A diferencia del resto de proveedores, aquí no hay endpoint HTTP: la
+ * autenticación vive en el propio CLI (`copilot login`) o en
+ * `COPILOT_GITHUB_TOKEN`. Por eso `copilotToken` se inyecta como variable de
+ * entorno en lugar de como cabecera.
+ *
+ * Decisiones deliberadas sobre los flags:
+ * - **No** se pasa `--allow-all-tools`. El CLI es un agente con acceso a shell y
+ *   al disco; un harness que sólo quiere texto no debe concederle eso. Sin el
+ *   flag, cualquier herramienta que pida queda denegada y responde igualmente.
+ * - `-C` apunta al directorio temporal y `--no-custom-instructions` evita que el
+ *   AGENTS.md del repo se cuele en el prompt de todos los agentes.
+ * - `temperature` y `maxTokens` no tienen equivalente en el CLI: se ignoran.
+ */
+async function callCopilotCli(
+  request: BridgeRequest,
+  token: string
+): Promise<BridgeResult> {
+  const prompt = request.systemPrompt
+    ? `${request.systemPrompt}\n\n---\n\n${request.userPrompt}`
+    : request.userPrompt;
+
+  const args = [
+    '--prompt',
+    prompt,
+    '--output-format',
+    'json',
+    '--no-color',
+    '--log-level',
+    'none',
+    '--no-ask-user',
+    '--no-custom-instructions',
+    '--no-auto-update',
+    '--no-remote-export',
+    '--disable-builtin-mcps',
+    '--disallow-temp-dir',
+    '-C',
+    tmpdir(),
+  ];
+
+  const wireModel = COPILOT_MODEL_MAP[request.model];
+  if (wireModel) args.push('--model', wireModel);
+
+  const env = { ...process.env };
+  if (token) env.COPILOT_GITHUB_TOKEN = token;
+
+  let stdout = '';
+  let stderr = '';
+  let execError: unknown;
+
+  try {
+    ({ stdout, stderr } = await execFilePromise('copilot', args, {
+      timeout: COPILOT_TIMEOUT_MS,
+      maxBuffer: 64 * 1024 * 1024,
+      cwd: tmpdir(),
+      env,
+    }));
+  } catch (err) {
+    // Con salida distinta de cero el CLI puede haber respondido igualmente:
+    // se conserva stdout y se decide después de parsearlo.
+    execError = err;
+    stdout = (err as { stdout?: string })?.stdout ?? '';
+    stderr = (err as { stderr?: string })?.stderr ?? '';
+  }
+
+  // El plan de Copilot decide qué modelos admite `--model`. En las cuentas
+  // restringidas (p. ej. Copilot Free) sólo funciona el modo automático, aunque
+  // `copilot help config` liste el catálogo completo.
+  if (wireModel && /is not available/i.test(stderr)) {
+    return {
+      success: false,
+      message:
+        `Tu plan de Copilot no permite elegir "${wireModel}" con --model. ` +
+        'Usa el modelo "Copilot (automático)", que deja que el CLI escoja, o cambia a un plan que habilite la selección de modelo.',
+    };
+  }
+
+  if (execError && !stdout) {
+    const code = (execError as { code?: string | number })?.code;
+    if (code === 'ENOENT') {
+      return {
+        success: false,
+        message:
+          'El binario `copilot` no está en el PATH. Instálalo con `brew install copilot` (o `npm i -g @github/copilot`) y autentícate con `copilot login`.',
+      };
+    }
+    if ((execError as { killed?: boolean })?.killed) {
+      return {
+        success: false,
+        message: `El CLI de Copilot superó el tiempo límite de ${COPILOT_TIMEOUT_MS / 1000} s.`,
+      };
+    }
+    // Se prefiere stderr al mensaje de execFile: este último incluye la línea de
+    // comando completa, y con ella el prompt entero del usuario.
+    const detail = stderr.trim().split('\n')[0] || errorMessage(execError);
+    return { success: false, message: `Fallo al ejecutar el CLI de Copilot: ${detail}` };
+  }
+
+  const { output, outputTokens, exitCode, errorText } = parseCopilotJsonl(stdout);
+
+  if (!output) {
+    const detail =
+      errorText ||
+      (exitCode ? `el CLI terminó con código ${exitCode}` : 'no emitió ningún mensaje del asistente');
+    return {
+      success: false,
+      message: `El CLI de Copilot no devolvió respuesta: ${detail}. Comprueba la sesión con \`copilot login\`.`,
+    };
+  }
+
+  return {
+    success: true,
+    output,
+    source: 'cli_binary',
+    usage: { promptTokens: 0, completionTokens: outputTokens },
+  };
+}
+
 /**
  * Invoca un binario local. Usa execFile con array de argumentos, nunca una
  * plantilla de shell: el prompt es texto arbitrario del usuario y con `exec`
@@ -194,27 +386,30 @@ export async function runProviderBridge(request: BridgeRequest): Promise<BridgeR
       };
     }
 
-    if (provider === 'openai' || provider === 'copilot-cli') {
-      const apiKey =
-        keys.openaiApiKey?.trim() ||
+    if (provider === 'copilot-cli') {
+      // Copilot no se atiende con la API de OpenAI: un token de GitHub contra
+      // api.openai.com siempre da 401. Su única ruta real es el CLI propio,
+      // que trae su propia sesión autenticada.
+      const token =
         keys.copilotToken?.trim() ||
-        process.env.OPENAI_API_KEY ||
+        process.env.COPILOT_GITHUB_TOKEN ||
+        process.env.GH_TOKEN ||
         process.env.GITHUB_TOKEN ||
         '';
+
+      return await callCopilotCli(request, token);
+    }
+
+    if (provider === 'openai') {
+      const apiKey = keys.openaiApiKey?.trim() || process.env.OPENAI_API_KEY || '';
 
       if (apiKey.length > 5) {
         return await callOpenAI(request, apiKey);
       }
 
-      if (provider === 'copilot-cli') {
-        const cliResult = await callCliBinary('gh', ['copilot', 'suggest', request.userPrompt]);
-        if (cliResult) return cliResult;
-      }
-
       return {
         success: false,
-        message:
-          'No hay OPENAI_API_KEY / GITHUB_TOKEN configurados ni un binario `gh` disponible en el PATH.',
+        message: 'No hay OPENAI_API_KEY configurada para el proveedor OpenAI.',
       };
     }
 

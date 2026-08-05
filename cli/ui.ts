@@ -236,7 +236,8 @@ ${c(colors.bold, 'ENVIRONMENT VARIABLES:')}
   ${c(colors.brightYellow, 'GEMINI_API_KEY')}      Google Gemini API key
   ${c(colors.brightYellow, 'ANTHROPIC_API_KEY')}   Anthropic (Claude) API key
   ${c(colors.brightYellow, 'OPENAI_API_KEY')}      OpenAI API key
-  ${c(colors.brightYellow, 'GITHUB_TOKEN')}        GitHub token for Copilot CLI
+  ${c(colors.brightYellow, 'COPILOT_GITHUB_TOKEN')} GitHub token for the Copilot CLI
+                        (optional: "copilot login" is the usual route)
 
 ${c(colors.bold, 'EXAMPLES:')}
   ${c(colors.dim, '# Interactive mode')}

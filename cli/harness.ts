@@ -13,6 +13,7 @@
 
 import * as path from 'path';
 import * as fs from 'fs';
+import { execFileSync } from 'child_process';
 import { AgentConfig, ProviderKeys, getProviderFromModel } from '@/types/agent';
 import { runAgentEngine } from '@/lib/agentEngine';
 import { DEFAULT_AGENTS } from '@/lib/presets';
@@ -85,12 +86,23 @@ function loadAgents(): AgentConfig[] {
 
 // ── Build provider keys from environment ──────────────────────────────
 
+/** ¿Está el binario `copilot` en el PATH? Es la única precondición real del proveedor. */
+function hasCopilotBinary(): boolean {
+  try {
+    execFileSync('copilot', ['--version'], { stdio: 'ignore', timeout: 10_000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function getProviderKeysFromEnv(): ProviderKeys {
   return {
     geminiApiKey: process.env.GEMINI_API_KEY || process.env.NEXT_PUBLIC_GEMINI_API_KEY || '',
     anthropicApiKey: process.env.ANTHROPIC_API_KEY || '',
     openaiApiKey: process.env.OPENAI_API_KEY || '',
-    copilotToken: process.env.GITHUB_TOKEN || '',
+    copilotToken:
+      process.env.COPILOT_GITHUB_TOKEN || process.env.GH_TOKEN || process.env.GITHUB_TOKEN || '',
   };
 }
 
@@ -189,7 +201,13 @@ async function interactiveMode(agents: AgentConfig[]): Promise<void> {
   keyStatus('Gemini', keys.geminiApiKey);
   keyStatus('Anthropic', keys.anthropicApiKey);
   keyStatus('OpenAI', keys.openaiApiKey);
-  keyStatus('GitHub/Copilot', keys.copilotToken);
+
+  // Copilot no se autentica con una key en esta app: lo que importa es que el
+  // binario `copilot` exista, porque la sesión vive dentro de él.
+  const copilotStatus = hasCopilotBinary()
+    ? c(colors.brightGreen, '● CLI ready')
+    : c(colors.dim, '○ `copilot` not in PATH');
+  console.log(`     ${c(colors.white, 'Copilot'.padEnd(18))} ${copilotStatus}`);
 
   // Main interaction loop
   let running = true;

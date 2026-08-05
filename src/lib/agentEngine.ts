@@ -352,18 +352,21 @@ Configura \`ANTHROPIC_API_KEY\`, o instala el CLI \`claude\` y comprueba que est
   if (provider === 'copilot-cli' || agent.model.startsWith('copilot-')) {
     return `${banner}## 🐙 GitHub Copilot CLI (${agent.name})
 
-**Comando que se habría invocado:** \`gh copilot suggest "${prompt.substring(0, 60)}..."\`
+**Comando que se habría invocado:** \`copilot --prompt "${prompt.substring(0, 60)}..." --output-format json\`
 
 ---
 
 \`\`\`bash
-# Credenciales que necesita este agente
-export OPENAI_API_KEY="sk-proj-..."   # o GITHUB_TOKEN para la ruta Copilot
-npm run dev
+# Este agente no usa API key: se apoya en la sesión del CLI de Copilot
+brew install copilot        # o: npm i -g @github/copilot
+copilot login               # autentica la máquina que sirve la app
+
+# Alternativa sin login interactivo (por ejemplo, en un contenedor)
+export COPILOT_GITHUB_TOKEN="ghp_..."
 \`\`\`
 
 ### 📌 Para obtener una respuesta real
-Configura \`OPENAI_API_KEY\` / \`GITHUB_TOKEN\`, o instala \`gh\` con la extensión Copilot.`;
+Instala el binario \`copilot\`, comprueba que está en el PATH del proceso que sirve la app y ejecuta \`copilot login\` (o define \`COPILOT_GITHUB_TOKEN\`).`;
   }
 
   // SIMULACIONES GENERALES POR ESPECIALIDAD
