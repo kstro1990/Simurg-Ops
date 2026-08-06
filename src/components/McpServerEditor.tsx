@@ -389,7 +389,9 @@ export const McpServerEditor: React.FC<McpServerEditorProps> = ({ servers, onCha
                     {state.error && (
                       <p className="mt-2 text-[10px] text-rose-400 flex items-start gap-1.5">
                         <AlertTriangle className="w-3 h-3 mt-0.5 shrink-0" />
-                        {state.error}
+                        {/* El stderr del servidor llega en varias líneas (p. ej. los
+                            pasos que imprime obsidian-mcp); sin esto se aplastan. */}
+                        <span className="whitespace-pre-line font-mono">{state.error}</span>
                       </p>
                     )}
 

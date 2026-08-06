@@ -27,6 +27,11 @@ import {
 
 const CLIENT_INFO = { name: 'ai-agent-harness', version: '0.1.0' };
 
+/** Tope del buffer de stderr, para que un servidor ruidoso no infle memoria. */
+const STDERR_LIMIT = 8 * 1024;
+/** Recorte del stderr al mostrarlo en la UI. */
+const STDERR_DISPLAY_LIMIT = 600;
+
 function errorMessage(err: unknown): string {
   if (err instanceof Error) return err.message;
   return String(err);
@@ -59,22 +64,54 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
   });
 }
 
-function buildStdioTransport(server: McpServerConfig): Transport {
+/** Un transporte junto a lo que su proceso haya escrito en stderr, si aplica. */
+interface TransportAttempt {
+  transport: Transport;
+  readStderr: () => string;
+}
+
+/**
+ * Error de arranque que arrastra el stderr del proceso hijo. Sin esto, un
+ * servidor que muere durante el handshake solo produce "-32000 Connection
+ * closed", que no dice nada: el motivo real siempre va por stderr.
+ */
+class McpStartupError extends Error {
+  stderr: string;
+  constructor(cause: unknown, stderr: string) {
+    super(cause instanceof Error ? cause.message : String(cause));
+    this.name = 'McpStartupError';
+    this.stderr = stderr;
+  }
+}
+
+function buildStdioTransport(server: McpServerConfig): TransportAttempt {
   const command = server.command?.trim();
   if (!command) {
     throw new Error('El servidor stdio no tiene comando configurado.');
   }
-  return new StdioClientTransport({
+  const transport = new StdioClientTransport({
     command,
     args: server.args?.filter((arg) => arg.length > 0) ?? [],
     // getDefaultEnvironment() filtra el entorno del proceso a lo seguro de heredar
     // (PATH, HOME…); encima van las variables que declaró el usuario.
     env: { ...getDefaultEnvironment(), ...(server.env ?? {}) },
-    stderr: 'ignore',
+    stderr: 'pipe',
   });
+
+  // El listener se engancha AHORA, antes de connect(): el SDK devuelve el
+  // PassThrough de inmediato justo para esto, y una tubería que nadie drena
+  // acaba bloqueando a un servidor hablador.
+  let captured = '';
+  transport.stderr?.on('data', (chunk: Buffer | string) => {
+    if (captured.length >= STDERR_LIMIT) return;
+    captured += chunk.toString();
+    if (captured.length > STDERR_LIMIT) captured = captured.slice(0, STDERR_LIMIT);
+  });
+
+  return { transport, readStderr: () => captured.trim() };
 }
 
-function buildHttpTransports(server: McpServerConfig): Transport[] {
+function buildHttpTransports(server: McpServerConfig): TransportAttempt[] {
   const raw = server.url?.trim();
   if (!raw) {
     throw new Error('El servidor HTTP no tiene URL configurada.');
@@ -82,11 +119,12 @@ function buildHttpTransports(server: McpServerConfig): Transport[] {
   const url = new URL(raw);
   const headers = server.headers && Object.keys(server.headers).length > 0 ? server.headers : undefined;
   // Streamable HTTP es el transporte actual; SSE es el legado. El SDK no hace
-  // el fallback solo, así que se intenta en orden.
+  // el fallback solo, así que se intenta en orden. No hay proceso hijo, así que
+  // tampoco hay stderr que capturar.
   return [
     new StreamableHTTPClientTransport(url, { requestInit: headers ? { headers } : undefined }),
     new SSEClientTransport(url, { requestInit: headers ? { headers } : undefined }),
-  ];
+  ].map((transport) => ({ transport, readStderr: () => '' }));
 }
 
 /**
@@ -95,18 +133,22 @@ function buildHttpTransports(server: McpServerConfig): Transport[] {
  */
 async function withClient<T>(server: McpServerConfig, fn: (client: Client) => Promise<T>): Promise<T> {
   const ms = timeoutOf(server);
-  const transports = server.transport === 'stdio' ? [buildStdioTransport(server)] : buildHttpTransports(server);
+  const attempts =
+    server.transport === 'stdio' ? [buildStdioTransport(server)] : buildHttpTransports(server);
 
   // Se conserva el error del PRIMER transporte: es el principal, y si se
   // reportara el del reintento SSE un 401 acabaría saliendo como el 404 que
   // devuelve el endpoint al no tener ruta GET.
   let firstError: unknown;
-  for (let i = 0; i < transports.length; i++) {
+  for (const attempt of attempts) {
     const client = new Client(CLIENT_INFO);
     try {
-      await withTimeout(client.connect(transports[i]), ms, 'Conexión MCP');
+      await withTimeout(client.connect(attempt.transport), ms, 'Conexión MCP');
     } catch (err) {
-      if (firstError === undefined) firstError = err;
+      // El proceso puede seguir escribiendo el motivo justo al morir; se le da
+      // un respiro para que el stderr llegue antes de construir el mensaje.
+      await new Promise((r) => setTimeout(r, 50));
+      if (firstError === undefined) firstError = new McpStartupError(err, attempt.readStderr());
       await client.close().catch(() => {});
       // Un fallo de autenticación no es un desajuste de transporte: reintentar
       // por SSE solo enmascararía la causa real.
@@ -239,10 +281,25 @@ export async function runMcpBridge(request: McpCallRequest): Promise<McpCallResu
   }
 }
 
+/** Recorta el stderr sin partir una línea por la mitad. */
+function trimStderr(text: string): string {
+  if (text.length <= STDERR_DISPLAY_LIMIT) return text;
+  const cut = text.slice(0, STDERR_DISPLAY_LIMIT);
+  const lastBreak = cut.lastIndexOf('\n');
+  return `${(lastBreak > 0 ? cut.slice(0, lastBreak) : cut).trimEnd()}\n…`;
+}
+
 /** Traduce fallos habituales a algo accionable en la UI. */
 function describeFailure(server: McpServerConfig, err: unknown): string {
   const message = errorMessage(err);
   const label = server.name || server.id;
+
+  // Lo que el propio servidor imprimió gana a cualquier error de protocolo:
+  // "Vault directory does not exist: /ruta" vale mucho más que "Connection closed".
+  const stderr = err instanceof McpStartupError ? err.stderr : '';
+  if (stderr) {
+    return `MCP [${label}]: ${trimStderr(stderr)}`;
+  }
 
   if (server.transport === 'stdio') {
     if (message.includes('ENOENT')) {
@@ -250,6 +307,12 @@ function describeFailure(server: McpServerConfig, err: unknown): string {
     }
     if (message.includes('EACCES')) {
       return `MCP [${label}]: sin permisos para ejecutar "${server.command}".`;
+    }
+    if (/-32000|connection closed/i.test(message)) {
+      // Sin stderr no hay nada que traducir: el proceso arrancó y se cerró sin
+      // hablar MCP. Lo accionable es que el usuario lo lance a mano y mire.
+      const cmd = [server.command, ...(server.args ?? [])].join(' ');
+      return `MCP [${label}]: el proceso arrancó y se cerró sin completar el handshake MCP, y no escribió nada en stderr. Pruébalo a mano en una terminal: ${cmd}`;
     }
   } else {
     if (/401|unauthorized/i.test(message)) {
