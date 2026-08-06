@@ -119,6 +119,8 @@ Same bridge indirection as providers — `mcpFn` is injected, never imported fro
 | Server routes, `telegramService` | `runMcpBridge` (`src/lib/mcpClient.ts`) |
 | `cli/harness.ts` | `directMcp` (`cli/cliEngine.ts`) |
 
+`parseMcpConfig()` (`src/lib/mcpConfigImport.ts`) backs the editor's "Pegar JSON" box: it ingests the `{"mcpServers": {…}}` block every MCP server publishes, in any of its three shapes (wrapped, bare map, single server). Hand-transcribing that block into the form fields is where configuration goes wrong — a package name and a path left on one line of the args textarea arrive as a single `argv` entry, and the resulting `npm ENOENT` names a path nobody typed. Importing keeps the array pre-split. Note that a path with spaces is a legitimate single argument, so a "looks glued together" heuristic can't be written without false-positiving on correct configs — that's why the fix is import, not detection.
+
 `/api/mcp/tools` lists a server's tools; it backs the modal's "Probar conexión" button so the user picks from the real catalog instead of typing names blind.
 
 `ThoughtStep.toolName` is typed to the local `ToolName` union, so MCP steps leave it undefined and carry their identity in `toolArgs` (`mcpServer`, `mcpTool`); `ExecutionPanel` labels them via `mcpStepLabel()`.

@@ -1,9 +1,20 @@
 'use client';
 
 import React, { useState } from 'react';
-import { Plug, Plus, Trash2, Check, Loader2, AlertTriangle, ChevronDown, ChevronRight } from 'lucide-react';
+import {
+  Plug,
+  Plus,
+  Trash2,
+  Check,
+  Loader2,
+  AlertTriangle,
+  ChevronDown,
+  ChevronRight,
+  ClipboardPaste,
+} from 'lucide-react';
 import { McpServerConfig, McpToolCall, McpToolInfo, MCP_DEFAULT_TIMEOUT_MS } from '@/types/mcp';
 import { fetchMcpTools } from '@/lib/mcpBridgeClient';
+import { parseMcpConfig } from '@/lib/mcpConfigImport';
 
 interface McpServerEditorProps {
   servers: McpServerConfig[];
@@ -95,6 +106,9 @@ export const McpServerEditor: React.FC<McpServerEditorProps> = ({ servers, onCha
   /** Texto crudo del editor de argumentos, para poder teclear JSON inválido sin perder el foco. */
   const [argsDrafts, setArgsDrafts] = useState<Record<string, string>>({});
   const [argsErrors, setArgsErrors] = useState<Record<string, string>>({});
+  const [importOpen, setImportOpen] = useState(false);
+  const [importText, setImportText] = useState('');
+  const [importError, setImportError] = useState('');
 
   const patch = (id: string, changes: Partial<McpServerConfig>) => {
     onChange(servers.map((s) => (s.id === id ? { ...s, ...changes } : s)));
@@ -104,6 +118,22 @@ export const McpServerEditor: React.FC<McpServerEditorProps> = ({ servers, onCha
     const server = newServer();
     onChange([...servers, server]);
     setExpanded(server.id);
+  };
+
+  const importJson = () => {
+    const result = parseMcpConfig(importText);
+    if (result.servers.length === 0) {
+      setImportError(result.error ?? 'No se pudo importar.');
+      return;
+    }
+    onChange([...servers, ...result.servers]);
+    // Se expande el último para que el usuario vea lo que entró y pueda pulsar
+    // "Probar conexión" sin buscarlo.
+    setExpanded(result.servers[result.servers.length - 1].id);
+    setImportText('');
+    // `error` con servidores importados significa "esto se omitió", no un fallo.
+    setImportError(result.error ?? '');
+    if (!result.error) setImportOpen(false);
   };
 
   const removeServer = (id: string) => {
@@ -167,15 +197,74 @@ export const McpServerEditor: React.FC<McpServerEditorProps> = ({ servers, onCha
           <Plug className="w-4 h-4 text-cyan-400" />
           Servidores MCP de este agente
         </span>
-        <button
-          type="button"
-          onClick={addServer}
-          className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-semibold text-cyan-300 bg-cyan-500/10 border border-cyan-500/30 hover:bg-cyan-500/20 transition-colors"
-        >
-          <Plus className="w-3 h-3" />
-          Añadir servidor
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setImportOpen((v) => !v)}
+            className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-semibold text-cyan-300 bg-cyan-500/10 border border-cyan-500/30 hover:bg-cyan-500/20 transition-colors"
+          >
+            <ClipboardPaste className="w-3 h-3" />
+            Pegar JSON
+          </button>
+          <button
+            type="button"
+            onClick={addServer}
+            className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-semibold text-cyan-300 bg-cyan-500/10 border border-cyan-500/30 hover:bg-cyan-500/20 transition-colors"
+          >
+            <Plus className="w-3 h-3" />
+            Añadir servidor
+          </button>
+        </div>
       </div>
+
+      {importOpen && (
+        <div className="mb-3 p-3 rounded-xl bg-slate-900/60 border border-cyan-500/20">
+          <p className="text-[10px] text-slate-400 mb-2">
+            Pega el bloque de configuración tal cual lo publica el servidor MCP. Evita
+            transcribirlo campo a campo, que es donde se cuela el error clásico de dejar el
+            paquete y la ruta en el mismo argumento.
+          </p>
+          <textarea
+            rows={6}
+            spellCheck={false}
+            placeholder={
+              '{\n  "mcpServers": {\n    "obsidian": {\n      "command": "npx",\n      "args": ["-y", "obsidian-mcp", "/ruta/a/tu/vault"]\n    }\n  }\n}'
+            }
+            value={importText}
+            onChange={(e) => {
+              setImportText(e.target.value);
+              setImportError('');
+            }}
+            className="w-full px-3 py-2 rounded-lg glass-input text-[11px] font-mono"
+          />
+          {importError && (
+            <p className="mt-1.5 text-[10px] text-rose-400 flex items-start gap-1.5">
+              <AlertTriangle className="w-3 h-3 mt-0.5 shrink-0" />
+              <span className="whitespace-pre-line">{importError}</span>
+            </p>
+          )}
+          <div className="flex justify-end gap-2 mt-2">
+            <button
+              type="button"
+              onClick={() => {
+                setImportOpen(false);
+                setImportText('');
+                setImportError('');
+              }}
+              className="px-3 py-1 rounded-lg text-[11px] font-semibold text-slate-400 hover:text-white bg-slate-900 border border-white/10 transition-colors"
+            >
+              Cancelar
+            </button>
+            <button
+              type="button"
+              onClick={importJson}
+              className="px-3 py-1 rounded-lg text-[11px] font-bold text-slate-950 bg-cyan-400 hover:bg-cyan-300 transition-colors"
+            >
+              Importar
+            </button>
+          </div>
+        </div>
+      )}
 
       <p className="text-[10px] text-slate-500 mb-3">
         Las tools MCP se ejecutan <strong>antes</strong> de generar y su salida se añade al prompt.
@@ -298,11 +387,18 @@ export const McpServerEditor: React.FC<McpServerEditorProps> = ({ servers, onCha
                             value={(server.args ?? []).join('\n')}
                             onChange={(e) =>
                               patch(server.id, {
-                                args: e.target.value.split('\n').filter((a) => a.trim().length > 0),
+                                args: e.target.value
+                                  .split('\n')
+                                  .map((a) => a.trim())
+                                  .filter((a) => a.length > 0),
                               })
                             }
                             className="w-full px-3 py-2 rounded-lg glass-input text-[11px] font-mono"
                           />
+                          <p className="text-[10px] text-slate-500 mt-1">
+                            Un argumento por línea. Las rutas con espacios van tal cual,{' '}
+                            <strong>sin comillas</strong>.
+                          </p>
                         </div>
                         <div>
                           <label className="block text-[10px] font-semibold text-slate-400 mb-1">
