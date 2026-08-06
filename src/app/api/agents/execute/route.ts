@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { runAgentEngine } from '@/lib/agentEngine';
 import { runProviderBridge } from '@/lib/providerBridge';
-import { runMcpBridge } from '@/lib/mcpClient';
+import { listMcpTools, runMcpBridge } from '@/lib/mcpClient';
 import { getStoredSettings } from '@/lib/serverStorage';
 import { AgentConfig, ProviderKeys } from '@/types/agent';
 
@@ -30,6 +30,7 @@ export async function POST(req: NextRequest) {
       // resolvería y la ejecución caería silenciosamente al simulador.
       bridgeFn: runProviderBridge,
       mcpFn: runMcpBridge,
+      mcpListFn: listMcpTools,
     });
 
     return NextResponse.json({

@@ -5,7 +5,7 @@ import { AgentConfig, ExecutionRun, ThoughtStep, ProviderKeys } from '@/types/ag
 import { Play, Terminal, Cpu, Clock, Copy, Check, Sparkles, Bot, FlaskConical } from 'lucide-react';
 import { runAgentEngine } from '@/lib/agentEngine';
 import { fetchProviderBridge } from '@/lib/bridgeClient';
-import { fetchMcpBridge } from '@/lib/mcpBridgeClient';
+import { fetchMcpBridge, fetchMcpTools } from '@/lib/mcpBridgeClient';
 import { Markdown } from './Markdown';
 
 interface ExecutionPanelProps {
@@ -76,6 +76,7 @@ export const ExecutionPanel: React.FC<ExecutionPanelProps> = ({
         providerKeys,
         bridgeFn: fetchProviderBridge,
         mcpFn: fetchMcpBridge,
+        mcpListFn: fetchMcpTools,
         onStepUpdate: (step: ThoughtStep) => {
           streamedSteps.push(step);
           setCurrentRun((prev) => (prev ? { ...prev, steps: [...prev.steps, step] } : null));

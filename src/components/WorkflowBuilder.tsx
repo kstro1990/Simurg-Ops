@@ -15,7 +15,7 @@ import {
 } from 'lucide-react';
 import { runAgentEngine } from '@/lib/agentEngine';
 import { fetchProviderBridge } from '@/lib/bridgeClient';
-import { fetchMcpBridge } from '@/lib/mcpBridgeClient';
+import { fetchMcpBridge, fetchMcpTools } from '@/lib/mcpBridgeClient';
 import { Markdown } from './Markdown';
 
 interface WorkflowBuilderProps {
@@ -120,6 +120,7 @@ export const WorkflowBuilder: React.FC<WorkflowBuilderProps> = ({
           providerKeys,
           bridgeFn: fetchProviderBridge,
           mcpFn: fetchMcpBridge,
+          mcpListFn: fetchMcpTools,
         });
 
         currentInput = result.finalOutput;

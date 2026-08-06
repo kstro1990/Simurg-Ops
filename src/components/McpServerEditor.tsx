@@ -12,7 +12,7 @@ import {
   ChevronRight,
   ClipboardPaste,
 } from 'lucide-react';
-import { McpServerConfig, McpToolCall, McpToolInfo, MCP_DEFAULT_TIMEOUT_MS } from '@/types/mcp';
+import { McpMode, McpServerConfig, McpToolCall, McpToolInfo, MCP_DEFAULT_TIMEOUT_MS } from '@/types/mcp';
 import { fetchMcpTools } from '@/lib/mcpBridgeClient';
 import { parseMcpConfig } from '@/lib/mcpConfigImport';
 
@@ -77,25 +77,103 @@ function formatHeaders(headers?: Record<string, string>): string {
     .join('\n');
 }
 
+/** Nombres cuyo valor razonablemente ES la consulta del usuario. */
+const QUERY_NAMES = [
+  'query',
+  'q',
+  'search',
+  'searchquery',
+  'pattern',
+  'term',
+  'keyword',
+  'prompt',
+  'text',
+  'question',
+  'input',
+  'content',
+  'message',
+];
+
 /**
- * Prellena los argumentos a partir del `inputSchema` de la tool: las propiedades
- * obligatorias de tipo string reciben `{{prompt}}`, que el cliente sustituye por
- * la petición del usuario en cada ejecución.
+ * Nombres que identifican o ubican algo. Meter el prompt aquí es siempre un
+ * error, y sin esta lista la regla de "única string obligatoria" lo cometería:
+ * `list_directory` de server-filesystem declara sólo `path`.
+ */
+const IDENTIFIER_NAMES = [
+  'path',
+  'file',
+  'filename',
+  'filepath',
+  'dir',
+  'directory',
+  'folder',
+  'uri',
+  'url',
+  'vault',
+  'id',
+  'name',
+  'key',
+  'repo',
+  'owner',
+  'branch',
+];
+
+/**
+ * Prellena los argumentos a partir del `inputSchema`.
+ *
+ * `{{prompt}}` va en **como máximo una** propiedad. Antes se ponía en todas las
+ * strings obligatorias, y como las 11 tools de obsidian-mcp exigen `vault`, cada
+ * tool nacía con el prompt del usuario metido ahí ("Unknown vault: dime que
+ * puedes hacer..."). El resto de obligatorias quedan vacías a propósito: un
+ * hueco visible es mejor que un valor inventado que parece correcto.
  */
 function draftArguments(tool: McpToolInfo): Record<string, unknown> {
   const schema = tool.inputSchema as
-    | { properties?: Record<string, { type?: string }>; required?: string[] }
+    | {
+        properties?: Record<string, { type?: string; default?: unknown; enum?: unknown[] }>;
+        required?: string[];
+      }
     | undefined;
   const required = schema?.required ?? [];
   const properties = schema?.properties ?? {};
+
+  const isString = (key: string) => {
+    const type = properties[key]?.type;
+    return !type || type === 'string';
+  };
+
+  // 1. Por nombre, primero entre las obligatorias y luego entre las opcionales.
+  const candidates = [...required, ...Object.keys(properties).filter((k) => !required.includes(k))];
+  let promptKey = candidates.find(
+    (key) => isString(key) && QUERY_NAMES.includes(key.toLowerCase())
+  );
+
+  // 2. Si no hay coincidencia y sólo hay una string obligatoria, esa — salvo que
+  //    sea un identificador o una ubicación.
+  if (!promptKey) {
+    const requiredStrings = required.filter(isString);
+    if (
+      requiredStrings.length === 1 &&
+      !IDENTIFIER_NAMES.includes(requiredStrings[0].toLowerCase())
+    ) {
+      promptKey = requiredStrings[0];
+    }
+  }
+
   const out: Record<string, unknown> = {};
   for (const key of required) {
-    const type = properties[key]?.type;
-    if (type === 'number' || type === 'integer') out[key] = 0;
-    else if (type === 'boolean') out[key] = false;
-    else if (type === 'array') out[key] = [];
-    else if (type === 'object') out[key] = {};
-    else out[key] = '{{prompt}}';
+    const prop = properties[key];
+    if (key === promptKey) {
+      out[key] = '{{prompt}}';
+      continue;
+    }
+    if (prop?.default !== undefined) out[key] = prop.default;
+    else if (Array.isArray(prop?.enum) && prop.enum.length > 0) out[key] = prop.enum[0];
+    else if (prop?.type === 'number' || prop?.type === 'integer') out[key] = 0;
+    else if (prop?.type === 'boolean') out[key] = false;
+    else if (prop?.type === 'array') out[key] = [];
+    else if (prop?.type === 'object') out[key] = {};
+    else out[key] = '';
   }
   return out;
 }
@@ -151,7 +229,20 @@ export const McpServerEditor: React.FC<McpServerEditorProps> = ({ servers, onCha
     }));
   };
 
-  const toggleCall = (server: McpServerConfig, tool: McpToolInfo) => {
+  const toggleCall = (server: McpServerConfig, tool: McpToolInfo, allTools: McpToolInfo[]) => {
+    if (server.mode === 'agentic') {
+      // Lista vacía significa "todas"; al desmarcar una hay que materializar el
+      // resto, o se entendería como "ninguna restricción" y seguiría activa.
+      const current = server.allowedTools?.length
+        ? server.allowedTools
+        : allTools.map((t) => t.name);
+      const next = current.includes(tool.name)
+        ? current.filter((name) => name !== tool.name)
+        : [...current, tool.name];
+      patch(server.id, { allowedTools: next });
+      return;
+    }
+
     const exists = server.calls.some((c) => c.toolName === tool.name);
     if (exists) {
       patch(server.id, { calls: server.calls.filter((c) => c.toolName !== tool.name) });
@@ -450,6 +541,36 @@ export const McpServerEditor: React.FC<McpServerEditorProps> = ({ servers, onCha
 
                   <div>
                     <label className="block text-[10px] font-semibold text-slate-400 mb-1">
+                      Modo de uso de las tools
+                    </label>
+                    <select
+                      value={server.mode ?? 'preflight'}
+                      onChange={(e) => patch(server.id, { mode: e.target.value as McpMode })}
+                      className="w-full px-3 py-1.5 rounded-lg glass-input text-xs"
+                    >
+                      <option value="preflight">
+                        Pre-flight — se invocan las tools que marques, siempre
+                      </option>
+                      <option value="agentic">
+                        Agéntico — el modelo elige qué tool usar y con qué argumentos
+                      </option>
+                    </select>
+                    {server.mode === 'agentic' ? (
+                      <p className="text-[10px] text-slate-500 mt-1">
+                        Requiere un proveedor con canal de tool-calling: <strong>Gemini</strong> o{' '}
+                        <strong>Anthropic por API</strong> (claude-opus-5, claude-sonnet-5…). Los
+                        modelos por CLI (Claude Code, Copilot) no lo soportan.
+                      </p>
+                    ) : (
+                      <p className="text-[10px] text-slate-500 mt-1">
+                        Las tools marcadas se ejecutan en cada mensaje con argumentos fijos. No
+                        marques tools de escritura aquí.
+                      </p>
+                    )}
+                  </div>
+
+                  <div>
+                    <label className="block text-[10px] font-semibold text-slate-400 mb-1">
                       Timeout (ms)
                     </label>
                     <input
@@ -500,11 +621,21 @@ export const McpServerEditor: React.FC<McpServerEditorProps> = ({ servers, onCha
                     {state.tools && state.tools.length > 0 && (
                       <div className="mt-2.5 space-y-2">
                         <p className="text-[10px] text-slate-500">
-                          {state.tools.length} tools disponibles. Marca las que deba invocar el
-                          agente en cada ejecución:
+                          {state.tools.length} tools disponibles.{' '}
+                          {server.mode === 'agentic'
+                            ? 'Marca las que quieras ofrecerle al modelo (todas marcadas = sin restricción):'
+                            : 'Marca las que deba invocar el agente en cada ejecución:'}
                         </p>
                         {state.tools.map((tool) => {
-                          const call = server.calls.find((c) => c.toolName === tool.name);
+                          const agentic = server.mode === 'agentic';
+                          // En modo agéntico la casilla elige qué tools ve el
+                          // modelo; sin ninguna marcada, las ve todas.
+                          const call = agentic
+                            ? (server.allowedTools?.length ?? 0) === 0 ||
+                              server.allowedTools?.includes(tool.name)
+                              ? { toolName: tool.name }
+                              : undefined
+                            : server.calls.find((c) => c.toolName === tool.name);
                           const key = `${server.id}::${tool.name}`;
                           return (
                             <div
@@ -517,7 +648,7 @@ export const McpServerEditor: React.FC<McpServerEditorProps> = ({ servers, onCha
                             >
                               <button
                                 type="button"
-                                onClick={() => toggleCall(server, tool)}
+                                onClick={() => toggleCall(server, tool, state.tools ?? [])}
                                 className="flex items-start gap-2 text-left w-full"
                               >
                                 <div
@@ -539,7 +670,7 @@ export const McpServerEditor: React.FC<McpServerEditorProps> = ({ servers, onCha
                                 </div>
                               </button>
 
-                              {call && (
+                              {call && !agentic && (
                                 <div className="mt-2">
                                   <label className="block text-[10px] font-semibold text-slate-400 mb-1">
                                     Argumentos (JSON)

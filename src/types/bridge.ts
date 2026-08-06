@@ -1,4 +1,5 @@
 import { AIProvider, AgentModel, ProviderKeys } from './agent';
+import type { McpServerConfig, McpTraceEntry } from './mcp';
 
 export interface BridgeRequest {
   provider: AIProvider;
@@ -8,6 +9,13 @@ export interface BridgeRequest {
   temperature: number;
   maxTokens: number;
   keys: ProviderKeys;
+  /**
+   * Servidores MCP en modo agéntico. Solo lo usa la ruta de Anthropic: el bucle
+   * de tool-calling corre dentro del puente porque ahí ya se puede hablar con
+   * los servidores MCP sin pasar por HTTP, y así el estado de la conversación
+   * nunca cruza la frontera navegador/servidor.
+   */
+  mcpServers?: McpServerConfig[];
 }
 
 export interface BridgeUsage {
@@ -23,6 +31,8 @@ export interface BridgeResult {
   /** Motivo del fallo cuando success === false. */
   message?: string;
   usage?: BridgeUsage;
+  /** Tools MCP que el modelo decidió llamar, en orden. */
+  toolTrace?: McpTraceEntry[];
 }
 
 /**

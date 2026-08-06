@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { runAgentEngine } from '@/lib/agentEngine';
 import { runProviderBridge } from '@/lib/providerBridge';
-import { runMcpBridge } from '@/lib/mcpClient';
+import { listMcpTools, runMcpBridge } from '@/lib/mcpClient';
 import { getStoredSettings } from '@/lib/serverStorage';
 import { AgentConfig, ProviderKeys, WorkflowConfig } from '@/types/agent';
 
@@ -48,6 +48,7 @@ export async function POST(req: NextRequest) {
         providerKeys: effectiveKeys,
         bridgeFn: runProviderBridge,
         mcpFn: runMcpBridge,
+        mcpListFn: listMcpTools,
       });
 
       anySimulated = anySimulated || result.simulated;

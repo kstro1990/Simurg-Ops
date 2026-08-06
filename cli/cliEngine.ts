@@ -8,9 +8,9 @@
  */
 
 import { runProviderBridge } from '@/lib/providerBridge';
-import { runMcpBridge } from '@/lib/mcpClient';
+import { listMcpTools, runMcpBridge } from '@/lib/mcpClient';
 import { BridgeRequest, BridgeResult } from '@/types/bridge';
-import { McpCallRequest, McpCallResult } from '@/types/mcp';
+import { McpCallRequest, McpCallResult, McpListRequest, McpListResult } from '@/types/mcp';
 
 export type CliBridgeRequest = BridgeRequest;
 export type CliBridgeResponse = BridgeResult;
@@ -26,4 +26,9 @@ export async function directBridge(request: CliBridgeRequest): Promise<CliBridge
  */
 export async function directMcp(request: McpCallRequest): Promise<McpCallResult> {
   return runMcpBridge(request);
+}
+
+/** Listado de tools MCP para el CLI; lo necesita el modo agéntico. */
+export async function directMcpList(request: McpListRequest): Promise<McpListResult> {
+  return listMcpTools(request);
 }

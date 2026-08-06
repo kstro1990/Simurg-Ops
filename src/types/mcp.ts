@@ -11,6 +11,20 @@
 
 export type McpTransport = 'stdio' | 'http';
 
+/**
+ * Cómo se usan las tools de un servidor:
+ *
+ * - `preflight` — se invocan las tools declaradas en `calls`, siempre, antes de
+ *   generar. El modelo no elige nada. Funciona con todos los proveedores.
+ * - `agentic` — se le pasan los esquemas de las tools al modelo y él decide cuál
+ *   llamar y con qué argumentos, iterando hasta terminar. Es el uso correcto de
+ *   MCP y el único que hace útiles las tools de escritura, pero requiere un
+ *   proveedor con canal de tool-calling: Gemini y Anthropic por API. Los
+ *   proveedores por CLI (`claude-code`, `copilot-cli`) son one-shot y no lo
+ *   soportan; ahí se degrada a `preflight`.
+ */
+export type McpMode = 'preflight' | 'agentic';
+
 /** Una invocación pre-flight: qué tool llamar y con qué argumentos fijos. */
 export interface McpToolCall {
   toolName: string;
@@ -40,8 +54,17 @@ export interface McpServerConfig {
   /** Timeout por operación. Por defecto `MCP_DEFAULT_TIMEOUT_MS`. */
   timeoutMs?: number;
 
-  /** Tools que se invocan en cada ejecución. Vacío = el servidor no aporta contexto. */
+  /** Por defecto `preflight`, para no cambiar el comportamiento de lo ya guardado. */
+  mode?: McpMode;
+
+  /** Solo en modo `preflight`: tools que se invocan en cada ejecución. */
   calls: McpToolCall[];
+
+  /**
+   * Solo en modo `agentic`: tools que se le ofrecen al modelo. Vacío o ausente =
+   * todas las que exponga el servidor.
+   */
+  allowedTools?: string[];
 }
 
 export interface McpToolInfo {
@@ -84,4 +107,47 @@ export interface McpCallResult {
  */
 export type McpFn = (request: McpCallRequest) => Promise<McpCallResult>;
 
+/**
+ * Listado de tools, con el mismo criterio de inyección que `McpFn`. El modo
+ * agéntico lo necesita para construir los esquemas que ve el modelo.
+ */
+export type McpListFn = (request: McpListRequest) => Promise<McpListResult>;
+
 export const MCP_DEFAULT_TIMEOUT_MS = 30_000;
+
+/** Tope de vueltas del bucle agéntico, para que un modelo no se quede en bucle. */
+export const MCP_MAX_ITERATIONS = 8;
+
+/**
+ * Los nombres de tool MCP (`search-vault`, `read-note`) llevan guiones, que los
+ * proveedores no siempre aceptan como nombre de función. Se sanean y se guarda
+ * el mapa inverso.
+ */
+export function sanitizeToolName(serverId: string, toolName: string): string {
+  return `${serverId}__${toolName}`.replace(/[^a-zA-Z0-9_]/g, '_');
+}
+
+/**
+ * Registro de una tool ejecutada durante un bucle agéntico. Cuando el bucle
+ * corre en el servidor (Anthropic), el navegador no puede ver los pasos en vivo:
+ * la traza viaja en el resultado y el motor la convierte en `ThoughtStep`.
+ */
+export interface McpTraceEntry {
+  server: string;
+  tool: string;
+  arguments: Record<string, unknown>;
+  ok: boolean;
+  output?: string;
+  message?: string;
+}
+
+/** Una tool MCP ya resuelta y lista para ofrecérsela a un modelo. */
+export interface McpBoundTool {
+  /** Nombre saneado que ve el modelo. */
+  alias: string;
+  /** Nombre real en el servidor. */
+  toolName: string;
+  server: McpServerConfig;
+  description: string;
+  inputSchema: Record<string, unknown>;
+}

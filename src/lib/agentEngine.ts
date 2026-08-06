@@ -7,7 +7,8 @@ import {
   getProviderFromModel,
 } from '@/types/agent';
 import { BridgeFn } from '@/types/bridge';
-import { McpFn } from '@/types/mcp';
+import { McpBoundTool, McpFn, McpListFn, MCP_MAX_ITERATIONS } from '@/types/mcp';
+import { agenticServers, executeBoundTool, preflightServers, resolveAgenticTools } from './mcpTools';
 import { TOOLS } from './tools';
 import { GoogleGenAI } from '@google/genai';
 
@@ -39,6 +40,8 @@ export interface ExecuteAgentOptions {
    * contexto opcional, el proveedor no.
    */
   mcpFn?: McpFn;
+  /** Listado de tools MCP; solo hace falta en modo agéntico. */
+  mcpListFn?: McpListFn;
 }
 
 export interface AgentExecutionResult {
@@ -67,7 +70,8 @@ function errorMessage(err: unknown): string {
 }
 
 export async function runAgentEngine(options: ExecuteAgentOptions): Promise<AgentExecutionResult> {
-  const { agent, userPrompt, apiKey, providerKeys, onStepUpdate, bridgeFn, mcpFn } = options;
+  const { agent, userPrompt, apiKey, providerKeys, onStepUpdate, bridgeFn, mcpFn, mcpListFn } =
+    options;
   const startTime = Date.now();
   const steps: ThoughtStep[] = [];
   const strictMode = Boolean(providerKeys?.strictMode);
@@ -88,6 +92,15 @@ export async function runAgentEngine(options: ExecuteAgentOptions): Promise<Agen
   const provider = getProviderFromModel(agent.model);
   /** Motivos por los que cada ruta real falló, para el mensaje del modo estricto. */
   const failures: string[] = [];
+
+  /**
+   * El tool-calling real necesita un canal en el proveedor. Gemini y Anthropic
+   * por API lo tienen; Copilot y OpenAI no están implementados aquí, y
+   * `claude-code` solo lo consigue si hay API key de Anthropic (si cae al
+   * binario CLI, es one-shot). Sin este aviso la degradación sería invisible:
+   * el agente respondería sin tools y sin decir por qué.
+   */
+  const AGENTIC_CAPABLE: AIProvider[] = ['gemini', 'anthropic', 'claude-code'];
 
   /**
    * El contexto de herramientas se calcula una sola vez por ejecución. Antes se
@@ -146,9 +159,7 @@ export async function runAgentEngine(options: ExecuteAgentOptions): Promise<Agen
    * `toolArgs`.
    */
   const runMcpServers = async (): Promise<string> => {
-    const servers = (agent.mcpServers ?? []).filter(
-      (server) => server.enabled && server.calls?.length > 0
-    );
+    const servers = preflightServers(agent.mcpServers);
     if (servers.length === 0) return '';
 
     if (!mcpFn) {
@@ -198,12 +209,99 @@ export async function runAgentEngine(options: ExecuteAgentOptions): Promise<Agen
     return context;
   };
 
+  const agenticRequested = agenticServers(agent.mcpServers);
+  if (agenticRequested.length > 0 && !AGENTIC_CAPABLE.includes(provider)) {
+    const detail = `El agente tiene servidores MCP en modo agéntico (${agenticRequested
+      .map((s) => s.name || s.id)
+      .join(', ')}) pero el proveedor ${provider.toUpperCase()} no expone canal de tool-calling. Cambia el modelo a uno de Gemini o de Anthropic por API, o pásalos a modo pre-flight.`;
+    failures.push(detail);
+    addStep({ type: 'error', content: `[MCP]: ${detail}` });
+  }
+
   /** Ejecuta las herramientas del agente y devuelve el contexto recopilado. */
   const runTools = async (): Promise<string> => {
     if (toolContextCache !== null) return toolContextCache;
     const context = (await runLocalTools()) + (await runMcpServers());
     toolContextCache = context;
     return context;
+  };
+
+  /**
+   * Tools MCP en modo agéntico, resueltas para Gemini. Solo la ruta de Gemini
+   * las usa desde aquí: la de Anthropic corre su bucle dentro del puente, donde
+   * ya puede hablar con los servidores MCP sin pasar por HTTP.
+   */
+  const resolveGeminiTools = async (): Promise<McpBoundTool[]> => {
+    const servers = agenticServers(agent.mcpServers);
+    if (servers.length === 0) return [];
+
+    if (!mcpListFn || !mcpFn) {
+      const detail =
+        'Hay servidores MCP en modo agéntico pero falta el transporte (mcpFn/mcpListFn). La ejecución continúa sin esas tools.';
+      failures.push(detail);
+      addStep({ type: 'error', content: `[MCP]: ${detail}` });
+      return [];
+    }
+
+    const { tools, failures: listFailures } = await resolveAgenticTools(servers, mcpListFn);
+    for (const failure of listFailures) {
+      failures.push(failure);
+      addStep({ type: 'error', content: failure });
+    }
+
+    if (tools.length > 0) {
+      addStep({
+        type: 'thought',
+        content: `Tool-calling MCP activo: ${tools.length} tools disponibles (${tools
+          .map((t) => t.toolName)
+          .join(', ')}). El modelo decide cuáles usar.`,
+      });
+    }
+    return tools;
+  };
+
+  /** Ejecuta la tool que pidió el modelo y devuelve el texto para realimentarlo. */
+  const runAgenticTool = async (
+    tools: McpBoundTool[],
+    alias: string,
+    args: Record<string, unknown>
+  ): Promise<string> => {
+    const tool = tools.find((candidate) => candidate.alias === alias);
+    if (!tool || !mcpFn) {
+      const detail = `El modelo pidió la tool "${alias}", que no está disponible.`;
+      addStep({ type: 'error', content: detail });
+      return detail;
+    }
+
+    addStep({
+      type: 'tool_call',
+      content: `El modelo llama a MCP [${tool.server.name || tool.server.id}] → ${tool.toolName}`,
+      toolArgs: {
+        mcpServer: tool.server.name || tool.server.id,
+        mcpTool: tool.toolName,
+        arguments: args,
+      },
+    });
+
+    const result = await executeBoundTool(tool, args, mcpFn);
+    const text = result.success
+      ? result.output || '(sin contenido)'
+      : result.message || 'La tool falló sin detalle.';
+
+    addStep({
+      type: result.success ? 'tool_result' : 'error',
+      content: result.success
+        ? `Resultado de MCP [${tool.server.name || tool.server.id}] → ${tool.toolName}`
+        : text,
+      toolResult: result.success ? text : undefined,
+      toolArgs: {
+        mcpServer: tool.server.name || tool.server.id,
+        mcpTool: tool.toolName,
+      },
+    });
+
+    if (!result.success) failures.push(text);
+    return text;
   };
 
   // --- 1. MOTOR GEMINI ---
@@ -231,21 +329,82 @@ export async function runAgentEngine(options: ExecuteAgentOptions): Promise<Agen
           content: 'Sintetizando razonamiento final y generando respuesta estructurada...',
         });
 
-        // Los IDs de Gemini a nivel de app coinciden con los de la API, así que
-        // se pasan tal cual. `normalizeModel` ya ha remapeado los retirados al
-        // cargar el agente, y añadir un modelo nuevo no requiere tocar esto.
-        const response = await ai.models.generateContent({
-          model: agent.model,
-          contents: promptWithTools,
-          config: {
-            temperature: agent.temperature,
-            maxOutputTokens: agent.maxTokens,
-          },
-        });
+        // Modo agéntico: se le pasan los esquemas MCP y él decide qué llamar.
+        const agenticTools = await resolveGeminiTools();
+        const geminiConfig: Record<string, unknown> = {
+          temperature: agent.temperature,
+          maxOutputTokens: agent.maxTokens,
+        };
+        if (agenticTools.length > 0) {
+          geminiConfig.tools = [
+            {
+              functionDeclarations: agenticTools.map((tool) => ({
+                name: tool.alias,
+                description: tool.description,
+                parameters: tool.inputSchema,
+              })),
+            },
+          ];
+        }
 
-        const text = response.text?.trim();
+        // El historial se acumula porque el bucle de tools necesita devolverle
+        // al modelo lo que pidió; sin tools es un único turno.
+        const contents: Array<Record<string, unknown>> = [
+          { role: 'user', parts: [{ text: promptWithTools }] },
+        ];
+
+        let text = '';
+        for (let iteration = 0; iteration < MCP_MAX_ITERATIONS; iteration++) {
+          // Los IDs de Gemini a nivel de app coinciden con los de la API, así que
+          // se pasan tal cual. `normalizeModel` ya ha remapeado los retirados al
+          // cargar el agente, y añadir un modelo nuevo no requiere tocar esto.
+          const response = await ai.models.generateContent({
+            model: agent.model,
+            contents,
+            config: geminiConfig,
+          });
+
+          const calls = response.functionCalls ?? [];
+          if (calls.length === 0) {
+            text = response.text?.trim() ?? '';
+            break;
+          }
+
+          // El turno del modelo se devuelve **sin reconstruir**: los modelos
+          // Gemini 3.x adjuntan un `thoughtSignature` a cada functionCall y
+          // rechazan con 400 el turno si no vuelve intacto.
+          const modelTurn = response.candidates?.[0]?.content;
+          contents.push(
+            modelTurn?.parts?.length
+              ? (modelTurn as unknown as Record<string, unknown>)
+              : {
+                  role: 'model',
+                  parts: calls.map((call) => ({
+                    functionCall: { name: call.name, args: call.args ?? {} },
+                  })),
+                }
+          );
+
+          const responses = [];
+          for (const call of calls) {
+            const output = await runAgenticTool(
+              agenticTools,
+              call.name ?? '',
+              (call.args ?? {}) as Record<string, unknown>
+            );
+            responses.push({
+              functionResponse: { name: call.name, response: { result: output } },
+            });
+          }
+          contents.push({ role: 'user', parts: responses });
+        }
+
         if (!text) {
-          throw new Error('Gemini devolvió una respuesta vacía.');
+          throw new Error(
+            agenticTools.length > 0
+              ? `Gemini no produjo respuesta final tras ${MCP_MAX_ITERATIONS} vueltas de tools.`
+              : 'Gemini devolvió una respuesta vacía.'
+          );
         }
 
         addStep({ type: 'output', content: text });
@@ -308,7 +467,29 @@ export async function runAgentEngine(options: ExecuteAgentOptions): Promise<Agen
           temperature: agent.temperature,
           maxTokens: agent.maxTokens,
           keys: providerKeys || {},
+          // El bucle agéntico de Anthropic corre dentro del puente.
+          mcpServers: agenticServers(agent.mcpServers),
         });
+
+        // El bucle agéntico corrió en el servidor, así que sus pasos no
+        // pudieron emitirse en vivo: llegan en la traza y se reconstruyen aquí.
+        for (const entry of bridgeResult.toolTrace ?? []) {
+          addStep({
+            type: 'tool_call',
+            content: `El modelo llamó a MCP [${entry.server}] → ${entry.tool}`,
+            toolArgs: { mcpServer: entry.server, mcpTool: entry.tool, arguments: entry.arguments },
+          });
+          if (entry.ok) {
+            addStep({
+              type: 'tool_result',
+              content: `Resultado de MCP [${entry.server}] → ${entry.tool}`,
+              toolResult: entry.output,
+              toolArgs: { mcpServer: entry.server, mcpTool: entry.tool },
+            });
+          } else {
+            addStep({ type: 'error', content: entry.message || 'La tool MCP falló.' });
+          }
+        }
 
         if (bridgeResult.success && bridgeResult.output) {
           addStep({
