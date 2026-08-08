@@ -1,11 +1,18 @@
 import { AIProvider, AgentModel, ProviderKeys } from './agent';
+import type { ConversationMessage } from './conversation';
 import type { McpServerConfig, McpTraceEntry } from './mcp';
 
 export interface BridgeRequest {
   provider: AIProvider;
   model: AgentModel;
   systemPrompt: string;
+  /** Turno actual, ya con el contexto de tools/MCP preflight añadido. */
   userPrompt: string;
+  /**
+   * Turnos previos, ya recortados por el motor y **sin** el turno actual.
+   * Omitirlo es el comportamiento one-shot de siempre.
+   */
+  history?: ConversationMessage[];
   temperature: number;
   maxTokens: number;
   keys: ProviderKeys;

@@ -85,12 +85,29 @@ Never treat a `simulated` run as model output.
 
 The client mirrors state into `aether_*` localStorage keys, but the server wins on load; localStorage is only a fallback when a fetch fails.
 
+### Multi-turn conversations
+
+`data/conversations.json` is the model's **live context**; `history.json` is an audit log. They are not merged, and context is never derived by filtering history — history's global 200-entry cap would evict a quiet bot's thread as soon as another agent got busy, and it mixes workflow steps in with chat turns.
+
+Shape: a map keyed `` `${agentId}::${threadKey}` `` (`conversationId()` in `src/types/conversation.ts`), threadKey being `web` or `tg:<chatId>`. Per-thread cap `CONVERSATION_MESSAGE_CAP` (60), plus thread eviction by oldest `updatedAt` at `CONVERSATION_THREAD_CAP` (200).
+
+**Only final assistant text is ever persisted.** No provider content objects — Gemini `parts` carrying a `thoughtSignature`, Anthropic blocks carrying thinking — go anywhere near this file. Prior turns re-enter each request as plain text and every agentic loop starts fresh, which is exactly why the two verbatim-echo rules below stay satisfiable: the objects that must be replayed untouched only ever live inside a single `runAgentEngine` call. Caching them across requests reintroduces the 400s.
+
+`selectContextMessages()` is the **only** guard on well-formedness, and it is load-bearing: it drops simulated turns, collapses consecutive same-role messages, strips a leading `assistant` and a trailing `user`, then windows to `memoryTurns * 2`. The trailing-`user` trim is not cosmetic — an unanswered question left at the end becomes two consecutive user turns as soon as the caller appends the current one. `AgentConfig.memoryTurns` (0 = no memory, absent = `DEFAULT_MEMORY_TURNS`) is the per-agent window; note that agents stored before this feature therefore gain memory on load.
+
+A failed run persists **nothing**. Half a turn on disk breaks role alternation for every subsequent request. Storage failures degrade memory but never abort a run — same principle as MCP, opposite of `bridgeFn`.
+
+Threading per provider lives in `src/lib/conversationFormat.ts`. Gemini, Anthropic and OpenAI take real message arrays; `copilot` and `claude -p` have no such interface, so `flattenTranscript()` renders the thread into their single argv string (and, with empty history, reproduces the old format byte-for-byte). That flattening is also what finally gives `claude -p` its system prompt, which the binary path used to drop outright. `claude --resume` is deliberately unused: it would bind state to the binary's own session store, invisible here and with different reset semantics from `/nuevo`.
+
+`/api/cli-bridge` rebuilds `BridgeRequest` field by field, so **any field not listed there is silently dropped** — that is where browser-side memory (and, before this, browser-side agentic MCP) goes missing.
+
 ### Telegram
 
 Each agent carries its own `telegramConfig` (one agent ↔ one bot). Enrolment requires a successful `/api/telegram/verify` call — the modal will not mark a bot `connected` on an unverified token.
 
 - **Polling** — `page.tsx` pings `/api/telegram/poll` every 3s, but sends no payload: agents, keys, and offsets are all read server-side, so reloading the page no longer reprocesses old messages.
 - **Webhook** — `/api/telegram/webhook?agentId=<id>` loads the real stored agent and its token. It never accepts credentials via query string. Set `TELEGRAM_WEBHOOK_SECRET` to require Telegram's `X-Telegram-Bot-Api-Secret-Token` header.
+- **Conversation** — one thread per `chat.id`. `processTelegramAgentRequest` returns `ExecutionRun | null`, `null` meaning the message was a command (`/nuevo`, `/start`, `/ayuda`) so there is no run to record — every call site needs the `if (run)` guard. `parseTelegramCommand()` tolerates the `@bot` suffix Telegram appends in groups; matching `text === '/nuevo'` would treat it as a prompt.
 
 ### Tools
 
