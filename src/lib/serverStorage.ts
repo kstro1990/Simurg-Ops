@@ -1,6 +1,13 @@
 import fs from 'fs/promises';
 import path from 'path';
 import { AgentConfig, WorkflowConfig, ExecutionRun, ProviderKeys, normalizeModel } from '@/types/agent';
+import {
+  ConversationMessage,
+  ConversationStore,
+  CONVERSATION_MESSAGE_CAP,
+  CONVERSATION_THREAD_CAP,
+  conversationId,
+} from '@/types/conversation';
 import { DEFAULT_AGENTS, DEFAULT_WORKFLOWS } from '@/lib/presets';
 
 const DATA_DIR = path.join(process.cwd(), 'data');
@@ -9,6 +16,7 @@ const WORKFLOWS_FILE = path.join(DATA_DIR, 'workflows.json');
 const HISTORY_FILE = path.join(DATA_DIR, 'history.json');
 const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
 const TELEGRAM_OFFSETS_FILE = path.join(DATA_DIR, 'telegram-offsets.json');
+const CONVERSATIONS_FILE = path.join(DATA_DIR, 'conversations.json');
 
 /** El historial se reescribe entero en cada ejecución: sin tope crece sin límite. */
 const HISTORY_LIMIT = 200;
@@ -122,13 +130,19 @@ export async function saveOrUpdateAgent(agent: AgentConfig): Promise<AgentConfig
 }
 
 export async function deleteStoredAgent(agentId: string): Promise<AgentConfig[]> {
-  return withLock(AGENTS_FILE, async () => {
+  const updated = await withLock(AGENTS_FILE, async () => {
     const { value } = await readJson<AgentConfig[]>(AGENTS_FILE);
     const agents = Array.isArray(value) ? value : DEFAULT_AGENTS;
-    const updated = agents.filter((a) => a.id !== agentId);
-    await writeJsonAtomic(AGENTS_FILE, updated);
-    return updated;
+    const next = agents.filter((a) => a.id !== agentId);
+    await writeJsonAtomic(AGENTS_FILE, next);
+    return next;
   });
+
+  // Fuera del lock de agentes: son ficheros distintos con locks distintos, y
+  // anidarlos invitaría a un interbloqueo en cuanto alguien los reordene.
+  await deleteAgentConversations(agentId);
+
+  return updated;
 }
 
 // --- WORKFLOWS ---
@@ -192,6 +206,120 @@ export async function saveStoredSettings(keys: ProviderKeys): Promise<ProviderKe
     const updated = { ...current, ...keys };
     await writeJsonAtomic(SETTINGS_FILE, updated);
     return updated;
+  });
+}
+
+// --- CONVERSACIONES ---
+// Contexto vivo del modelo, separado del historial: `history.json` es un log de
+// auditoría con tope global de 200 entradas, así que un bot tranquilo perdería
+// su hilo en cuanto otro agente se pusiera a trabajar.
+//
+// Solo texto plano: ver la nota de invariante en types/conversation.ts.
+
+export async function getStoredConversations(): Promise<ConversationStore> {
+  const { value } = await readJson<ConversationStore>(CONVERSATIONS_FILE);
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+}
+
+/**
+ * Mensajes del hilo en orden cronológico. Nunca lanza: si la memoria no se
+ * puede leer, la ejecución sigue sin contexto en vez de fallar.
+ */
+export async function getConversationMessages(
+  agentId: string,
+  threadKey: string
+): Promise<ConversationMessage[]> {
+  try {
+    const store = await getStoredConversations();
+    const thread = store[conversationId(agentId, threadKey)];
+    return Array.isArray(thread?.messages) ? thread.messages : [];
+  } catch (err) {
+    console.error('[serverStorage] No se pudo leer la conversación:', err);
+    return [];
+  }
+}
+
+/**
+ * Añade el turno completo (usuario + respuesta) en un único read-modify-write
+ * bajo el lock. Escribirlos por separado dejaría, ante un fallo intermedio, un
+ * mensaje de usuario colgado que rompe la alternancia de roles y provoca un 400
+ * en la siguiente petición.
+ */
+export async function appendConversationTurn(
+  agentId: string,
+  threadKey: string,
+  turn: { user: ConversationMessage; assistant?: ConversationMessage }
+): Promise<ConversationMessage[]> {
+  return withLock(CONVERSATIONS_FILE, async () => {
+    const { value } = await readJson<ConversationStore>(CONVERSATIONS_FILE);
+    const store: ConversationStore =
+      value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+
+    const key = conversationId(agentId, threadKey);
+    const now = new Date().toISOString();
+    const existing = store[key];
+
+    const messages = [
+      ...(Array.isArray(existing?.messages) ? existing.messages : []),
+      turn.user,
+      ...(turn.assistant ? [turn.assistant] : []),
+    ].slice(-CONVERSATION_MESSAGE_CAP);
+
+    store[key] = {
+      agentId,
+      threadKey,
+      messages,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+    };
+
+    // Desalojo por antigüedad: sin esto, un grupo que genere chat_id nuevos sin
+    // parar haría crecer el fichero indefinidamente.
+    const keys = Object.keys(store);
+    if (keys.length > CONVERSATION_THREAD_CAP) {
+      keys
+        .sort((a, b) => (store[a].updatedAt ?? '').localeCompare(store[b].updatedAt ?? ''))
+        .slice(0, keys.length - CONVERSATION_THREAD_CAP)
+        .forEach((stale) => delete store[stale]);
+    }
+
+    await writeJsonAtomic(CONVERSATIONS_FILE, store);
+    return messages;
+  });
+}
+
+/** Borra el hilo. Devuelve true si existía. */
+export async function resetConversation(agentId: string, threadKey: string): Promise<boolean> {
+  return withLock(CONVERSATIONS_FILE, async () => {
+    const { value } = await readJson<ConversationStore>(CONVERSATIONS_FILE);
+    const store: ConversationStore =
+      value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+
+    const key = conversationId(agentId, threadKey);
+    if (!store[key]) return false;
+
+    delete store[key];
+    await writeJsonAtomic(CONVERSATIONS_FILE, store);
+    return true;
+  });
+}
+
+/** Borra todos los hilos de un agente. Se llama al eliminarlo. */
+export async function deleteAgentConversations(agentId: string): Promise<void> {
+  await withLock(CONVERSATIONS_FILE, async () => {
+    const { value } = await readJson<ConversationStore>(CONVERSATIONS_FILE);
+    const store: ConversationStore =
+      value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+
+    let changed = false;
+    for (const [key, thread] of Object.entries(store)) {
+      if (thread.agentId === agentId) {
+        delete store[key];
+        changed = true;
+      }
+    }
+
+    if (changed) await writeJsonAtomic(CONVERSATIONS_FILE, store);
   });
 }
 

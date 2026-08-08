@@ -52,8 +52,11 @@ export async function POST(req: NextRequest) {
             providerKeys: settings,
             botToken,
           });
-          await addHistoryRun(run);
-          newRuns.push(run);
+          // `null` = era un comando (/nuevo, /ayuda): no hubo ejecución.
+          if (run) {
+            await addHistoryRun(run);
+            newRuns.push(run);
+          }
         } catch (err) {
           console.error(`Error procesando mensaje de Telegram para ${agent.name}:`, err);
         }

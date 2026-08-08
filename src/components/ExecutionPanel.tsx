@@ -1,8 +1,25 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { AgentConfig, ExecutionRun, ThoughtStep, ProviderKeys } from '@/types/agent';
-import { Play, Terminal, Cpu, Clock, Copy, Check, Sparkles, Bot, FlaskConical } from 'lucide-react';
+import {
+  ConversationMessage,
+  WEB_THREAD_KEY,
+  resolveMemoryTurns,
+} from '@/types/conversation';
+import {
+  Play,
+  Terminal,
+  Cpu,
+  Clock,
+  Copy,
+  Check,
+  Sparkles,
+  Bot,
+  FlaskConical,
+  Eraser,
+  Brain,
+} from 'lucide-react';
 import { runAgentEngine } from '@/lib/agentEngine';
 import { fetchProviderBridge } from '@/lib/bridgeClient';
 import { fetchMcpBridge, fetchMcpTools } from '@/lib/mcpBridgeClient';
@@ -45,9 +62,71 @@ export const ExecutionPanel: React.FC<ExecutionPanelProps> = ({
   const [isRunning, setIsRunning] = useState(false);
   const [currentRun, setCurrentRun] = useState<ExecutionRun | null>(null);
   const [copiedStepId, setCopiedStepId] = useState<string | null>(null);
+  const [messages, setMessages] = useState<ConversationMessage[]>([]);
+  const messagesRef = useRef<HTMLDivElement>(null);
+
+  const memoryTurns = resolveMemoryTurns(selectedAgent?.memoryTurns);
+  const agentId = selectedAgent?.id;
+
+  // Cambiar de agente vacía el panel al instante, en render y no en un efecto:
+  // así no se llega a pintar un fotograma con la conversación del agente
+  // anterior. Es el patrón que React documenta para reaccionar a un cambio de
+  // prop sin cascada de renders.
+  const [loadedAgentId, setLoadedAgentId] = useState(agentId);
+  if (agentId !== loadedAgentId) {
+    setLoadedAgentId(agentId);
+    setMessages([]);
+    setCurrentRun(null);
+  }
+
+  // Un hilo por agente en el workbench: encaja con el modelo de "un agente
+  // seleccionado" que ya tiene el panel, sin necesidad de un selector de hilos.
+  useEffect(() => {
+    if (!agentId) return;
+
+    let cancelled = false;
+
+    fetch(
+      `/api/conversations?agentId=${encodeURIComponent(agentId)}&threadKey=${WEB_THREAD_KEY}`
+    )
+      .then((res) => res.json())
+      .then((data) => {
+        if (!cancelled) setMessages(data.success ? data.messages : []);
+      })
+      .catch(() => {
+        if (!cancelled) setMessages([]);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [agentId]);
+
+  useEffect(() => {
+    messagesRef.current?.scrollTo({ top: messagesRef.current.scrollHeight });
+  }, [messages]);
+
+  const handleNewConversation = async () => {
+    if (!selectedAgent) return;
+    setMessages([]);
+    setCurrentRun(null);
+    await fetch(
+      `/api/conversations?agentId=${encodeURIComponent(selectedAgent.id)}&threadKey=${WEB_THREAD_KEY}`,
+      { method: 'DELETE' }
+    ).catch(console.error);
+  };
 
   const handleExecute = async () => {
     if (!selectedAgent || !prompt.trim() || isRunning) return;
+
+    const userPrompt = prompt.trim();
+    // El contexto se captura ANTES del append optimista: el turno actual viaja
+    // en `userPrompt`, no en el historial.
+    const history = messages;
+    const sentAt = new Date().toISOString();
+
+    setPrompt('');
+    setMessages((prev) => [...prev, { role: 'user', content: userPrompt, timestamp: sentAt }]);
 
     setIsRunning(true);
     const newRun: ExecutionRun = {
@@ -56,11 +135,12 @@ export const ExecutionPanel: React.FC<ExecutionPanelProps> = ({
       agentName: selectedAgent.name,
       agentAvatar: selectedAgent.avatar,
       agentRole: selectedAgent.role,
-      prompt: prompt.trim(),
+      prompt: userPrompt,
       status: 'running',
       steps: [],
       finalOutput: '',
-      timestamp: new Date().toISOString(),
+      timestamp: sentAt,
+      threadKey: WEB_THREAD_KEY,
     };
 
     setCurrentRun(newRun);
@@ -71,7 +151,8 @@ export const ExecutionPanel: React.FC<ExecutionPanelProps> = ({
     try {
       const result = await runAgentEngine({
         agent: selectedAgent,
-        userPrompt: prompt.trim(),
+        userPrompt,
+        history,
         apiKey,
         providerKeys,
         bridgeFn: fetchProviderBridge,
@@ -95,7 +176,33 @@ export const ExecutionPanel: React.FC<ExecutionPanelProps> = ({
 
       setCurrentRun(completedRun);
       onSaveRunHistory(completedRun);
+
+      const assistantMessage: ConversationMessage = {
+        role: 'assistant',
+        content: result.finalOutput,
+        timestamp: new Date().toISOString(),
+        runId: completedRun.id,
+        simulated: result.simulated,
+      };
+      setMessages((prev) => [...prev, assistantMessage]);
+
+      // El motor corre en el navegador, así que el turno se persiste por HTTP.
+      // Si esto falla, la conversación sigue viva en pantalla y solo se pierde
+      // la memoria: degradar es preferible a abortar un turno ya respondido.
+      fetch('/api/conversations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          agentId: selectedAgent.id,
+          threadKey: WEB_THREAD_KEY,
+          user: { role: 'user', content: userPrompt, timestamp: sentAt },
+          assistant: assistantMessage,
+        }),
+      }).catch(console.error);
     } catch (err) {
+      // El mensaje del usuario se queda en pantalla (para que vea qué envió)
+      // pero NO se persiste: medio turno en disco rompería la alternancia de
+      // roles y haría fallar la petición siguiente.
       const failedRun: ExecutionRun = {
         ...newRun,
         status: 'failed',
@@ -153,9 +260,18 @@ export const ExecutionPanel: React.FC<ExecutionPanelProps> = ({
         </div>
 
         <div className="glass-panel rounded-2xl p-5 border border-white/10">
-          <label htmlFor="task-prompt" className="block text-xs font-bold text-slate-300 mb-2">
-            2. Prompt / Instrucción de la Tarea
-          </label>
+          <div className="flex items-center justify-between mb-2">
+            <label htmlFor="task-prompt" className="block text-xs font-bold text-slate-300">
+              2. Prompt / Instrucción de la Tarea
+            </label>
+            <span
+              title="Turnos anteriores que el agente recibe como contexto. Se configura al editar el agente."
+              className="text-[10px] text-slate-400 flex items-center gap-1"
+            >
+              <Brain className="w-3 h-3 text-indigo-400" />
+              {memoryTurns === 0 ? 'Sin memoria' : `Memoria: ${memoryTurns} turnos`}
+            </span>
+          </div>
 
           <div className="mb-3">
             <div className="text-[10px] text-slate-400 mb-1.5 flex items-center gap-1">
@@ -177,34 +293,52 @@ export const ExecutionPanel: React.FC<ExecutionPanelProps> = ({
 
           <textarea
             id="task-prompt"
-            rows={5}
-            placeholder="Describe en detalle la tarea que deseas que ejecute el agente..."
+            rows={4}
+            placeholder="Describe la tarea, o continúa la conversación... (Enter para enviar, Mayús+Enter para salto de línea)"
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                handleExecute();
+              }
+            }}
             className="w-full px-3.5 py-2.5 rounded-xl glass-input text-xs leading-relaxed mb-4"
           />
 
-          <button
-            onClick={handleExecute}
-            disabled={!selectedAgent || !prompt.trim() || isRunning}
-            className={`w-full flex items-center justify-center gap-2 py-3 rounded-xl text-xs font-bold text-white shadow-lg transition-all ${
-              isRunning || !selectedAgent || !prompt.trim()
-                ? 'bg-slate-800 text-slate-400 cursor-not-allowed border border-white/5'
-                : 'bg-gradient-to-r from-indigo-600 via-indigo-500 to-cyan-500 hover:brightness-110 shadow-indigo-500/25 active:scale-95'
-            }`}
-          >
-            {isRunning ? (
-              <>
-                <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                Ejecutando Agente...
-              </>
-            ) : (
-              <>
-                <Play className="w-4 h-4 fill-current" />
-                Lanzar Agente
-              </>
-            )}
-          </button>
+          <div className="flex gap-2">
+            <button
+              onClick={handleExecute}
+              disabled={!selectedAgent || !prompt.trim() || isRunning}
+              className={`flex-1 flex items-center justify-center gap-2 py-3 rounded-xl text-xs font-bold text-white shadow-lg transition-all ${
+                isRunning || !selectedAgent || !prompt.trim()
+                  ? 'bg-slate-800 text-slate-400 cursor-not-allowed border border-white/5'
+                  : 'bg-gradient-to-r from-indigo-600 via-indigo-500 to-cyan-500 hover:brightness-110 shadow-indigo-500/25 active:scale-95'
+              }`}
+            >
+              {isRunning ? (
+                <>
+                  <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                  Ejecutando Agente...
+                </>
+              ) : (
+                <>
+                  <Play className="w-4 h-4 fill-current" />
+                  {messages.length > 0 ? 'Enviar' : 'Lanzar Agente'}
+                </>
+              )}
+            </button>
+
+            <button
+              onClick={handleNewConversation}
+              disabled={!selectedAgent || isRunning || messages.length === 0}
+              title="Olvidar la conversación y empezar de cero"
+              className="flex items-center justify-center gap-1.5 px-3.5 py-3 rounded-xl text-xs font-bold border transition-all disabled:opacity-40 disabled:cursor-not-allowed bg-slate-900/80 border-white/10 text-slate-300 hover:text-white hover:bg-slate-800"
+            >
+              <Eraser className="w-4 h-4" />
+              Nueva
+            </button>
+          </div>
         </div>
       </div>
 
@@ -266,10 +400,80 @@ export const ExecutionPanel: React.FC<ExecutionPanelProps> = ({
             )}
           </div>
 
+          {/* Lista de mensajes: la conversación en sí. */}
+          {messages.length > 0 && (
+            <div
+              ref={messagesRef}
+              className="flex-1 space-y-3 overflow-y-auto max-h-[420px] pr-2 mb-4"
+            >
+              {messages.map((message, index) => (
+                <div
+                  key={`${message.timestamp}-${index}`}
+                  className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}
+                >
+                  <div
+                    className={`max-w-[85%] rounded-2xl px-4 py-2.5 text-xs border ${
+                      message.role === 'user'
+                        ? 'bg-indigo-600/20 border-indigo-500/40 text-slate-100 whitespace-pre-wrap'
+                        : 'bg-slate-950/80 border-white/10 text-slate-200'
+                    }`}
+                  >
+                    {message.role === 'user' ? (
+                      message.content
+                    ) : (
+                      <Markdown>{message.content}</Markdown>
+                    )}
+                    {message.simulated && (
+                      <div className="mt-2 text-[9px] font-semibold text-amber-300 flex items-center gap-1">
+                        <FlaskConical className="w-3 h-3" />
+                        SIMULADO
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
           {currentRun ? (
-            <div className="flex-1 flex flex-col space-y-4 overflow-y-auto max-h-[600px] pr-2">
+            <details open={isRunning} className="group">
+              <summary className="cursor-pointer text-[11px] text-slate-400 hover:text-slate-200 flex items-center gap-1.5 mb-2 select-none">
+                <Brain className="w-3.5 h-3.5 text-indigo-400" />
+                Razonamiento del último turno ({currentRun.steps.length} pasos)
+              </summary>
+              <StepStream
+                steps={currentRun.steps}
+                copiedStepId={copiedStepId}
+                onCopy={handleCopyOutput}
+              />
+            </details>
+          ) : messages.length === 0 ? (
+            <div className="flex-1 flex flex-col items-center justify-center text-center p-8 border border-dashed border-white/10 rounded-xl bg-slate-950/30">
+              <Bot className="w-12 h-12 text-slate-400 mb-3" />
+              <h4 className="text-sm font-bold text-slate-300">Mesa de Trabajo Lista</h4>
+              <p className="text-xs text-slate-400 max-w-sm mt-1">
+                Selecciona un agente a la izquierda, ingresa tu instrucción y presiona{' '}
+                <strong>Lanzar Agente</strong> para ver la transmisión en tiempo real.
+              </p>
+            </div>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+interface StepStreamProps {
+  steps: ThoughtStep[];
+  copiedStepId: string | null;
+  onCopy: (stepId: string, content: string) => void;
+}
+
+/** Traza de razonamiento del turno en curso. Extraído tal cual del panel. */
+const StepStream: React.FC<StepStreamProps> = ({ steps, copiedStepId, onCopy }) => (
+  <div className="flex-1 flex flex-col space-y-4 overflow-y-auto max-h-[400px] pr-2">
               <div className="space-y-2">
-                {currentRun.steps.map((step) => (
+                {steps.map((step) => (
                   <div
                     key={step.id}
                     className={`p-3 rounded-xl text-xs font-mono border transition-all ${
@@ -307,7 +511,7 @@ export const ExecutionPanel: React.FC<ExecutionPanelProps> = ({
                           <div className="flex justify-between items-center mb-2 pb-2 border-b border-white/10">
                             <span className="font-bold text-indigo-400">Respuesta</span>
                             <button
-                              onClick={() => handleCopyOutput(step.id, step.content)}
+                              onClick={() => onCopy(step.id, step.content)}
                               className="flex items-center gap-1 text-[10px] text-slate-400 hover:text-white bg-slate-900 px-2 py-1 rounded border border-white/10"
                             >
                               {copiedStepId === step.id ? (
@@ -333,19 +537,5 @@ export const ExecutionPanel: React.FC<ExecutionPanelProps> = ({
                   </div>
                 ))}
               </div>
-            </div>
-          ) : (
-            <div className="flex-1 flex flex-col items-center justify-center text-center p-8 border border-dashed border-white/10 rounded-xl bg-slate-950/30">
-              <Bot className="w-12 h-12 text-slate-400 mb-3" />
-              <h4 className="text-sm font-bold text-slate-300">Mesa de Trabajo Lista</h4>
-              <p className="text-xs text-slate-400 max-w-sm mt-1">
-                Selecciona un agente a la izquierda, ingresa tu instrucción y presiona{' '}
-                <strong>Lanzar Agente</strong> para ver la transmisión en tiempo real.
-              </p>
-            </div>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-};
+  </div>
+);

@@ -1,7 +1,13 @@
 import { AgentConfig, ExecutionRun, ProviderKeys } from '@/types/agent';
+import { resolveMemoryTurns, telegramThreadKey } from '@/types/conversation';
 import { runAgentEngine } from './agentEngine';
 import { runProviderBridge } from './providerBridge';
 import { listMcpTools, runMcpBridge } from './mcpClient';
+import {
+  appendConversationTurn,
+  getConversationMessages,
+  resetConversation,
+} from './serverStorage';
 
 export interface TelegramBotInfo {
   id: number;
@@ -73,6 +79,24 @@ export async function sendTelegramMessage(
   return true;
 }
 
+export type TelegramCommand = 'nuevo' | 'start' | 'ayuda';
+
+/**
+ * Extrae el comando de un mensaje. El sufijo `@bot` no es opcional de tratar:
+ * en grupos Telegram entrega `/nuevo@mi_bot`, y un `text === '/nuevo'` lo
+ * tomaría por un prompt cualquiera.
+ */
+export function parseTelegramCommand(text: string): TelegramCommand | null {
+  const match = /^\/(nuevo|start|ayuda)(@\w+)?\b/i.exec(text.trim());
+  return match ? (match[1].toLowerCase() as TelegramCommand) : null;
+}
+
+/**
+ * Atiende un mensaje entrante de Telegram.
+ *
+ * Devuelve `null` cuando el mensaje era un comando: no hubo ejecución, así que
+ * tampoco hay nada que guardar en el historial.
+ */
 export async function processTelegramAgentRequest(options: {
   agent: AgentConfig;
   userPrompt: string;
@@ -80,8 +104,38 @@ export async function processTelegramAgentRequest(options: {
   apiKey?: string;
   providerKeys?: ProviderKeys;
   botToken: string;
-}): Promise<ExecutionRun> {
+}): Promise<ExecutionRun | null> {
   const { agent, userPrompt, chatId, apiKey, providerKeys, botToken } = options;
+
+  // Un hilo por chat: es lo que un usuario espera de un bot.
+  const threadKey = telegramThreadKey(chatId);
+  const memoryTurns = resolveMemoryTurns(agent.memoryTurns);
+
+  const command = parseTelegramCommand(userPrompt);
+
+  if (command === 'nuevo') {
+    await resetConversation(agent.id, threadKey);
+    await sendTelegramMessage(
+      botToken,
+      chatId,
+      '🧹 Conversación reiniciada. El agente ya no recuerda los mensajes anteriores.'
+    );
+    return null;
+  }
+
+  if (command === 'start' || command === 'ayuda') {
+    await sendTelegramMessage(
+      botToken,
+      chatId,
+      `🤖 *${agent.avatar} ${agent.name}* — ${agent.role}\n\n` +
+        `Modelo: ${agent.model}\n` +
+        `Memoria: ${memoryTurns === 0 ? 'desactivada' : `últimos ${memoryTurns} turnos`}\n\n` +
+        'Comandos:\n' +
+        '/nuevo — empezar una conversación nueva\n' +
+        '/ayuda — mostrar esta ayuda'
+    );
+    return null;
+  }
 
   // Aviso inicial de "procesando" al chat de Telegram
   await sendTelegramMessage(
@@ -90,10 +144,13 @@ export async function processTelegramAgentRequest(options: {
     `🤖 *${agent.name}* está procesando tu solicitud...\n\n_Pensamiento en progreso con modelo ${agent.model}_`
   );
 
+  const history = await getConversationMessages(agent.id, threadKey);
+
   try {
     const result = await runAgentEngine({
       agent,
       userPrompt,
+      history,
       apiKey,
       providerKeys,
       // Esto corre en el servidor: hay que invocar el puente directamente.
@@ -110,8 +167,27 @@ export async function processTelegramAgentRequest(options: {
 
     await sendTelegramMessage(botToken, chatId, telegramText);
 
+    const runId = 'run-tg-' + Date.now();
+    const now = new Date().toISOString();
+
+    // El par usuario+respuesta se guarda junto y de forma atómica: media
+    // conversación (solo el turno del usuario) rompería la alternancia de roles
+    // y provocaría un 400 en la petición siguiente.
+    await appendConversationTurn(agent.id, threadKey, {
+      user: { role: 'user', content: userPrompt, timestamp: now },
+      assistant: {
+        role: 'assistant',
+        content: result.finalOutput,
+        timestamp: now,
+        runId,
+        // Se guarda para que la transcripción sea honesta, pero el motor no lo
+        // realimenta: el agente no debe construir sobre texto inventado.
+        simulated: result.simulated,
+      },
+    });
+
     return {
-      id: 'run-tg-' + Date.now(),
+      id: runId,
       agentId: agent.id,
       agentName: agent.name,
       agentAvatar: agent.avatar,
@@ -124,12 +200,15 @@ export async function processTelegramAgentRequest(options: {
       timestamp: new Date().toISOString(),
       source: 'telegram',
       telegramChatId: String(chatId),
+      threadKey,
       simulated: result.simulated,
       provider: result.provider,
     };
   } catch (err) {
     // En modo estricto el motor lanza en vez de simular: el usuario de Telegram
-    // debe enterarse del fallo en lugar de quedarse esperando.
+    // debe enterarse del fallo en lugar de quedarse esperando. El turno fallido
+    // NO se persiste: dejaría un mensaje de usuario sin respuesta que rompe la
+    // alternancia de roles del hilo.
     const message = err instanceof Error ? err.message : String(err);
     await sendTelegramMessage(
       botToken,
@@ -150,6 +229,7 @@ export async function processTelegramAgentRequest(options: {
       timestamp: new Date().toISOString(),
       source: 'telegram',
       telegramChatId: String(chatId),
+      threadKey,
     };
   }
 }

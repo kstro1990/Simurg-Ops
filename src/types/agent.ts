@@ -126,6 +126,12 @@ export interface AgentConfig {
   temperature: number;
   maxTokens: number;
   tools: ToolName[];
+  /**
+   * Turnos previos (user + assistant) que se reinyectan como contexto en cada
+   * ejecución. 0 = sin memoria (el comportamiento one-shot original). Ausente
+   * = DEFAULT_MEMORY_TURNS. Ver types/conversation.ts.
+   */
+  memoryTurns?: number;
   /** Servidores MCP propios de este agente. Ver types/mcp.ts. */
   mcpServers?: McpServerConfig[];
   telegramConfig?: TelegramConfig;
@@ -166,6 +172,8 @@ export interface ExecutionRun {
   timestamp: string;
   source?: 'web' | 'telegram';
   telegramChatId?: string;
+  /** Hilo de conversación al que pertenece la ejecución. Solo trazabilidad. */
+  threadKey?: string;
   /** true si la salida la produjo el motor de simulación, no un modelo real. */
   simulated?: boolean;
   /** Proveedor que atendió la ejecución realmente. */

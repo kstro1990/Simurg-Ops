@@ -22,14 +22,20 @@ export async function POST(req: NextRequest) {
     // Las claves guardadas en el servidor son el respaldo de las que envía el cliente.
     const storedKeys = await getStoredSettings();
 
+    // OJO: la petición se reconstruye campo a campo, así que cualquier campo
+    // que no aparezca aquí se descarta en silencio. `mcpServers` faltaba, lo que
+    // dejaba al bucle agéntico de Anthropic sin servidores cuando la ejecución
+    // salía del navegador.
     const result = await runProviderBridge({
       provider: body.provider,
       model: body.model,
       systemPrompt: body.systemPrompt || '',
       userPrompt: body.userPrompt,
+      history: body.history,
       temperature: body.temperature ?? 0.3,
       maxTokens: body.maxTokens ?? 2048,
       keys: { ...storedKeys, ...(body.keys || {}) },
+      mcpServers: body.mcpServers,
     });
 
     return NextResponse.json(result, { status: result.success ? 200 : 502 });

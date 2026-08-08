@@ -4,6 +4,11 @@ import { promisify } from 'util';
 import { AgentModel } from '@/types/agent';
 import { BridgeRequest, BridgeResult } from '@/types/bridge';
 import { McpTraceEntry, MCP_MAX_ITERATIONS } from '@/types/mcp';
+import {
+  flattenTranscript,
+  toAnthropicMessages,
+  toOpenAIMessages,
+} from './conversationFormat';
 import { agenticServers, executeBoundTool, resolveAgenticTools } from './mcpTools';
 import { listMcpTools, runMcpBridge } from './mcpClient';
 
@@ -126,9 +131,12 @@ async function callAnthropic(request: BridgeRequest, apiKey: string): Promise<Br
   const byAlias = new Map(tools.map((tool) => [tool.alias, tool]));
   const toolTrace: McpTraceEntry[] = [];
 
-  // Los bloques del asistente se devuelven **sin tocar**: en Opus 5 el
-  // pensamiento va dentro y editarlo rompe el turno.
+  // Los turnos previos entran como texto plano; Anthropic los acepta conviviendo
+  // con los turnos de bloques que empuja el bucle de tools más abajo. Esos
+  // bloques se devuelven **sin tocar**: en Opus 5 el pensamiento va dentro y
+  // editarlo rompe el turno.
   const messages: Array<{ role: string; content: unknown }> = [
+    ...toAnthropicMessages(request.history ?? []),
     { role: 'user', content: request.userPrompt },
   ];
 
@@ -247,6 +255,7 @@ async function callOpenAI(request: BridgeRequest, apiKey: string): Promise<Bridg
       max_tokens: request.maxTokens,
       messages: [
         ...(request.systemPrompt ? [{ role: 'system', content: request.systemPrompt }] : []),
+        ...toOpenAIMessages(request.history ?? []),
         { role: 'user', content: request.userPrompt },
       ],
     }),
@@ -349,9 +358,13 @@ async function callCopilotCli(
   request: BridgeRequest,
   token: string
 ): Promise<BridgeResult> {
-  const prompt = request.systemPrompt
-    ? `${request.systemPrompt}\n\n---\n\n${request.userPrompt}`
-    : request.userPrompt;
+  // El CLI no tiene array de mensajes: la conversación se aplana a un string.
+  // Sin historial el resultado es idéntico al formato anterior.
+  const prompt = flattenTranscript(
+    request.history ?? [],
+    request.userPrompt,
+    request.systemPrompt
+  );
 
   const args = [
     '--prompt',
@@ -486,7 +499,16 @@ export async function runProviderBridge(request: BridgeRequest): Promise<BridgeR
       }
 
       if (provider === 'claude-code') {
-        const cliResult = await callCliBinary('claude', ['-p', request.userPrompt]);
+        // `claude -p` recibe un único string, así que el system prompt y los
+        // turnos previos van aplanados dentro. Antes se pasaba `userPrompt` a
+        // secas y la persona del agente se ignoraba por completo en esta ruta.
+        //
+        // No se usa `--resume`: ataría el estado a la sesión del binario, que es
+        // invisible para conversations.json y tendría otra semántica de reset.
+        const cliResult = await callCliBinary('claude', [
+          '-p',
+          flattenTranscript(request.history ?? [], request.userPrompt, request.systemPrompt),
+        ]);
         if (cliResult) return cliResult;
       }
 

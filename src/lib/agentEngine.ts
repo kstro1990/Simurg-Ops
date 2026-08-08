@@ -7,7 +7,13 @@ import {
   getProviderFromModel,
 } from '@/types/agent';
 import { BridgeFn } from '@/types/bridge';
+import {
+  ConversationMessage,
+  resolveMemoryTurns,
+  selectContextMessages,
+} from '@/types/conversation';
 import { McpBoundTool, McpFn, McpListFn, MCP_MAX_ITERATIONS } from '@/types/mcp';
+import { toGeminiContents } from './conversationFormat';
 import { agenticServers, executeBoundTool, preflightServers, resolveAgenticTools } from './mcpTools';
 import { TOOLS } from './tools';
 import { GoogleGenAI } from '@google/genai';
@@ -20,6 +26,12 @@ export interface ExecuteAgentOptions {
   apiKey?: string;
   providerKeys?: ProviderKeys;
   onStepUpdate?: (step: ThoughtStep) => void;
+  /**
+   * Turnos anteriores de la conversación, en orden cronológico y SIN incluir
+   * `userPrompt`, que sigue siendo el turno actual. El motor los recorta según
+   * `agent.memoryTurns`. Omitirlo deja el comportamiento one-shot de siempre.
+   */
+  history?: ConversationMessage[];
   /**
    * Transporte hacia los proveedores no-Gemini.
    * - Servidor y CLI: `runProviderBridge` (lib/providerBridge.ts).
@@ -76,6 +88,16 @@ export async function runAgentEngine(options: ExecuteAgentOptions): Promise<Agen
   const steps: ThoughtStep[] = [];
   const strictMode = Boolean(providerKeys?.strictMode);
 
+  // Se recorta una sola vez y lo comparten la rama de Gemini y la del puente.
+  // `selectContextMessages` es además el único sitio que garantiza que la
+  // secuencia está bien formada (empieza en 'user' y alterna): un fallo ahí es
+  // un 400 duro en Gemini y en Anthropic.
+  const history = selectContextMessages(
+    options.history ?? [],
+    resolveMemoryTurns(agent.memoryTurns)
+  );
+  const historyChars = history.reduce((total, message) => total + message.content.length, 0);
+
   const addStep = (step: Omit<ThoughtStep, 'id' | 'timestamp'>) => {
     const fullStep: ThoughtStep = {
       ...step,
@@ -88,6 +110,15 @@ export async function runAgentEngine(options: ExecuteAgentOptions): Promise<Agen
     }
     return fullStep;
   };
+
+  // Sin este paso la memoria es invisible en la traza: un agente que "recuerda
+  // de más" o "no recuerda nada" sería indepurable desde la UI.
+  if (history.length > 0) {
+    addStep({
+      type: 'thought',
+      content: `Contexto conversacional: ${Math.ceil(history.length / 2)} turnos previos (${history.length} mensajes).`,
+    });
+  }
 
   const provider = getProviderFromModel(agent.model);
   /** Motivos por los que cada ruta real falló, para el mensaje del modo estricto. */
@@ -322,7 +353,11 @@ export async function runAgentEngine(options: ExecuteAgentOptions): Promise<Agen
 
         const ai = new GoogleGenAI({ apiKey: effectiveApiKey });
         const toolContext = await runTools();
-        const promptWithTools = `${agent.systemPrompt}\n\n[USER REQUEST]:\n${userPrompt}${toolContext}`;
+        // El system prompt va en `systemInstruction`, no incrustado en el turno
+        // de usuario: con memoria, incrustarlo haría que las instrucciones
+        // aparecieran a mitad de conversación y dichas por el usuario, mientras
+        // los turnos anteriores (releídos de disco) no las llevan.
+        const promptWithTools = `[USER REQUEST]:\n${userPrompt}${toolContext}`;
 
         addStep({
           type: 'thought',
@@ -335,6 +370,9 @@ export async function runAgentEngine(options: ExecuteAgentOptions): Promise<Agen
           temperature: agent.temperature,
           maxOutputTokens: agent.maxTokens,
         };
+        if (agent.systemPrompt?.trim()) {
+          geminiConfig.systemInstruction = agent.systemPrompt;
+        }
         if (agenticTools.length > 0) {
           geminiConfig.tools = [
             {
@@ -347,9 +385,11 @@ export async function runAgentEngine(options: ExecuteAgentOptions): Promise<Agen
           ];
         }
 
-        // El historial se acumula porque el bucle de tools necesita devolverle
-        // al modelo lo que pidió; sin tools es un único turno.
+        // Turnos previos (texto plano) + turno actual. Dentro del bucle esto
+        // sigue creciendo con los turnos que el propio modelo produce, que se
+        // devuelven verbatim; esos nunca se persisten.
         const contents: Array<Record<string, unknown>> = [
+          ...toGeminiContents(history),
           { role: 'user', parts: [{ text: promptWithTools }] },
         ];
 
@@ -415,9 +455,10 @@ export async function runAgentEngine(options: ExecuteAgentOptions): Promise<Agen
           simulated: false,
           provider,
           metrics: {
-            promptTokens: Math.floor(userPrompt.length / 4) + 150,
+            promptTokens: Math.floor((userPrompt.length + historyChars) / 4) + 150,
             completionTokens: Math.floor(text.length / 4),
-            totalTokens: Math.floor((userPrompt.length + text.length) / 4) + 150,
+            totalTokens:
+              Math.floor((userPrompt.length + historyChars + text.length) / 4) + 150,
             latencyMs: Date.now() - startTime,
           },
         };
@@ -464,6 +505,7 @@ export async function runAgentEngine(options: ExecuteAgentOptions): Promise<Agen
           model: agent.model,
           systemPrompt: agent.systemPrompt,
           userPrompt: `${userPrompt}${toolContext}`,
+          history,
           temperature: agent.temperature,
           maxTokens: agent.maxTokens,
           keys: providerKeys || {},
@@ -500,7 +542,8 @@ export async function runAgentEngine(options: ExecuteAgentOptions): Promise<Agen
           addStep({ type: 'output', content: bridgeResult.output });
 
           const promptTokens =
-            bridgeResult.usage?.promptTokens || Math.floor(userPrompt.length / 4) + 120;
+            bridgeResult.usage?.promptTokens ||
+            Math.floor((userPrompt.length + historyChars) / 4) + 120;
           const completionTokens =
             bridgeResult.usage?.completionTokens || Math.floor(bridgeResult.output.length / 4);
 

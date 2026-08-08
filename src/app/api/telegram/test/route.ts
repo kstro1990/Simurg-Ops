@@ -33,6 +33,12 @@ export async function POST(req: NextRequest) {
       botToken,
     });
 
+    // `null` = era un comando (/nuevo, /ayuda). No es un fallo: sin esta guarda
+    // el modal reportaría un error donde el bot hizo justo lo que se le pidió.
+    if (!runResult) {
+      return NextResponse.json({ success: true, command: true });
+    }
+
     await addHistoryRun(runResult);
 
     return NextResponse.json({

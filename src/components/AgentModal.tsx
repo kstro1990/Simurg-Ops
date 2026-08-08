@@ -2,6 +2,7 @@
 
 import React, { useState } from 'react';
 import { AgentConfig, AgentModel, DEFAULT_MODEL, ToolName } from '@/types/agent';
+import { MAX_MEMORY_TURNS, resolveMemoryTurns } from '@/types/conversation';
 import { McpServerConfig } from '@/types/mcp';
 import { X, Wrench, Cpu, Check } from 'lucide-react';
 import { TOOLS } from '@/lib/tools';
@@ -71,6 +72,7 @@ export const AgentModal: React.FC<AgentModalProps> = ({ onClose, onSave, initial
   );
   const [temperature, setTemperature] = useState(initialAgent?.temperature ?? 0.3);
   const [maxTokens, setMaxTokens] = useState(initialAgent?.maxTokens ?? 2048);
+  const [memoryTurns, setMemoryTurns] = useState(resolveMemoryTurns(initialAgent?.memoryTurns));
   const [selectedTools, setSelectedTools] = useState<ToolName[]>(
     initialAgent?.tools ?? DEFAULT_TOOLS
   );
@@ -104,6 +106,7 @@ export const AgentModal: React.FC<AgentModalProps> = ({ onClose, onSave, initial
       temperature,
       maxTokens: safeMaxTokens,
       tools: selectedTools,
+      memoryTurns: resolveMemoryTurns(memoryTurns),
       mcpServers,
       // Este modal no edita el enrolamiento de Telegram: hay que arrastrarlo,
       // o guardar un agente enrolado lo desenrolaría sin avisar.
@@ -323,7 +326,7 @@ export const AgentModal: React.FC<AgentModalProps> = ({ onClose, onSave, initial
             <McpServerEditor servers={mcpServers} onChange={setMcpServers} />
           </div>
 
-          <div className="grid grid-cols-2 gap-4 pt-2 border-t border-white/10">
+          <div className="grid grid-cols-2 md:grid-cols-3 gap-4 pt-2 border-t border-white/10">
             <div>
               <div className="flex justify-between text-xs font-semibold text-slate-300 mb-1">
                 <span>Temperatura</span>
@@ -361,6 +364,35 @@ export const AgentModal: React.FC<AgentModalProps> = ({ onClose, onSave, initial
               />
               <p className="text-[9px] text-slate-500 mt-1">
                 Entre {MIN_MAX_TOKENS} y {MAX_MAX_TOKENS}.
+              </p>
+            </div>
+
+            <div>
+              <label
+                htmlFor="agent-memory-turns"
+                className="block text-xs font-semibold text-slate-300 mb-1"
+              >
+                Memoria conversacional (turnos)
+              </label>
+              <input
+                id="agent-memory-turns"
+                type="number"
+                min={0}
+                max={MAX_MEMORY_TURNS}
+                step="1"
+                value={memoryTurns}
+                onChange={(e) => {
+                  // Vaciar la caja debe quedarse en 0, no saltar al valor por
+                  // defecto, que es lo que haría `resolveMemoryTurns(NaN)`.
+                  const parsed = parseInt(e.target.value, 10);
+                  setMemoryTurns(Number.isFinite(parsed) ? resolveMemoryTurns(parsed) : 0);
+                }}
+                className="w-full px-3.5 py-1.5 rounded-xl glass-input text-xs"
+              />
+              <p className="text-[9px] text-slate-500 mt-1">
+                Turnos anteriores que el agente recuerda (0 = una sola pregunta por vez, sin
+                memoria). Cada turno extra se reenvía en cada petición, así que sube el consumo
+                de tokens.
               </p>
             </div>
           </div>

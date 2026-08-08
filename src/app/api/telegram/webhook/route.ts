@@ -64,6 +64,11 @@ export async function POST(req: NextRequest) {
       botToken,
     });
 
+    // `null` = era un comando (/nuevo, /ayuda): no hubo ejecución que registrar.
+    if (!run) {
+      return NextResponse.json({ ok: true, command: true });
+    }
+
     await addHistoryRun(run);
 
     return NextResponse.json({ ok: true, runId: run.id, simulated: run.simulated ?? false });
