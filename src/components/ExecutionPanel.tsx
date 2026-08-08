@@ -5,6 +5,7 @@ import { AgentConfig, ExecutionRun, ThoughtStep, ProviderKeys } from '@/types/ag
 import { Play, Terminal, Cpu, Clock, Copy, Check, Sparkles, Bot, FlaskConical } from 'lucide-react';
 import { runAgentEngine } from '@/lib/agentEngine';
 import { fetchProviderBridge } from '@/lib/bridgeClient';
+import { fetchMcpBridge, fetchMcpTools } from '@/lib/mcpBridgeClient';
 import { Markdown } from './Markdown';
 
 interface ExecutionPanelProps {
@@ -14,6 +15,16 @@ interface ExecutionPanelProps {
   apiKey: string;
   providerKeys?: ProviderKeys;
   onSaveRunHistory: (run: ExecutionRun) => void;
+}
+
+/**
+ * Los pasos MCP no llevan `toolName` (ese campo está tipado con el registro de
+ * herramientas locales); su identidad viaja en `toolArgs`.
+ */
+function mcpStepLabel(step: ThoughtStep): string | null {
+  const args = step.toolArgs as { mcpServer?: string; mcpTool?: string } | undefined;
+  if (!args?.mcpTool) return null;
+  return args.mcpServer ? `${args.mcpServer} / ${args.mcpTool}` : args.mcpTool;
 }
 
 const SAMPLE_PROMPTS = [
@@ -64,6 +75,8 @@ export const ExecutionPanel: React.FC<ExecutionPanelProps> = ({
         apiKey,
         providerKeys,
         bridgeFn: fetchProviderBridge,
+        mcpFn: fetchMcpBridge,
+        mcpListFn: fetchMcpTools,
         onStepUpdate: (step: ThoughtStep) => {
           streamedSteps.push(step);
           setCurrentRun((prev) => (prev ? { ...prev, steps: [...prev.steps, step] } : null));
@@ -274,8 +287,14 @@ export const ExecutionPanel: React.FC<ExecutionPanelProps> = ({
                     <div className="flex items-center justify-between text-[10px] opacity-70 mb-1">
                       <span className="font-bold uppercase tracking-wider flex items-center gap-1">
                         {step.type === 'thought' && '🧠 Razonamiento'}
-                        {step.type === 'tool_call' && `🛠️ Invocación: ${step.toolName}`}
-                        {step.type === 'tool_result' && `✅ Resultado: ${step.toolName}`}
+                        {step.type === 'tool_call' &&
+                          (step.toolName
+                            ? `🛠️ Invocación: ${step.toolName}`
+                            : `🔌 ${mcpStepLabel(step) ?? 'Invocación MCP'}`)}
+                        {step.type === 'tool_result' &&
+                          (step.toolName
+                            ? `✅ Resultado: ${step.toolName}`
+                            : `✅ Resultado MCP${mcpStepLabel(step) ? `: ${mcpStepLabel(step)}` : ''}`)}
                         {step.type === 'error' && '❌ Error de Ejecución'}
                         {step.type === 'output' && '📄 Salida Final'}
                       </span>

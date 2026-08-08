@@ -96,6 +96,47 @@ Each agent carries its own `telegramConfig` (one agent ↔ one bot). Enrolment r
 
 `src/lib/tools.ts` are pre-flight prompt enrichers, not model-driven tool calls: every tool on an agent runs unconditionally before generation and its JSON output is appended to the prompt. Each definition carries a `simulated` flag — `web_search`, `image_generator`, and `data_extractor` return labelled placeholder data. `code_executor` really runs JavaScript via `new Function`, **in-process and unsandboxed**; it only executes when an explicit `code` argument is supplied.
 
+`runTools()` in `agentEngine.ts` memoizes its result. It used to run once on the real-provider path and again in the simulator fallback — harmless for the placeholder tools, but with MCP that meant spawning processes and hitting remote APIs twice per request.
+
+### MCP: one server set per agent
+
+Each agent carries its own `mcpServers: McpServerConfig[]` (`src/types/mcp.ts`), edited in `McpServerEditor` inside `AgentModal` — same one-agent-one-config shape as `telegramConfig`.
+
+Each server picks a `mode`:
+
+- **`preflight`** (default, and what a stored server without the field gets) — pre-flight enricher, like `tools.ts`. The model never sees a schema: the user declares which tools to invoke and with what arguments, they all run before generation, and the output is appended as `[CONTEXT FROM MCP: <server> / <tool>]`. Works on every provider. Never put write tools here — they'd run on every message with fixed arguments.
+- **`agentic`** — real tool-calling. Schemas go to the model, it picks the tool and the arguments, the result is fed back, and it iterates up to `MCP_MAX_ITERATIONS`. This is the only mode that makes write tools useful, because they run only when the model asks.
+
+Agentic mode needs a provider with a tool-call channel: **Gemini** (loop in `agentEngine.ts`, using the injected `mcpFn`/`mcpListFn`) and **Anthropic by API** (loop inside `providerBridge.ts`, which is server-only and imports `mcpClient` directly, so conversation state never crosses the browser/server boundary). `copilot-cli` and `openai` are not wired; `claude-code` only qualifies when an Anthropic API key routes it to the API instead of the `claude -p` binary. The engine emits an explicit error step when an agent asks for agentic mode on a provider that can't do it — silent degradation would look like the tools simply doing nothing.
+
+Two echo-back rules, both learned the hard way and both the same principle — **return the model's turn unmodified**: Gemini 3.x attaches a `thoughtSignature` to each `functionCall` and 400s if the turn is reconstructed instead of replayed; Anthropic carries thinking inside the assistant blocks. Both loops push the provider's own content object back verbatim.
+
+`sanitizeSchema()` (`src/lib/mcpTools.ts`) prunes MCP's full JSON Schema down to the keys providers accept — Gemini rejects `$schema`, `additionalProperties`, `minLength` and friends. Tool names are aliased to `<serverId>__<tool>` with non-alphanumerics replaced, since MCP names carry hyphens.
+
+Because the Anthropic loop runs server-side, the browser can't see its steps live: the tools it called come back as `toolTrace` on the `BridgeResult` and the engine replays them into `ThoughtStep`s.
+
+- In `preflight` mode, arguments are static JSON and `{{prompt}}` is interpolated with the user's prompt anywhere in a string value, including nested — the only way a call can depend on the request. See `interpolateArgs()`. In `agentic` mode there is no interpolation: the model supplies the arguments, which is the whole point.
+- `draftArguments()` (`McpServerEditor.tsx`) prefills a preflight call from the tool's `inputSchema` and puts `{{prompt}}` in **at most one** property — chosen by name (`query`, `pattern`, …), never in an identifier or location (`vault`, `path`, `file`, …), with the remaining required fields left visibly empty. Filling every required string with it — the original behaviour — meant `search-vault` was born with the user's prompt in `vault`, and all 11 `obsidian-mcp` tools require `vault`. The identifier blacklist is load-bearing on its own: `list_directory` declares exactly one required string, `path`.
+- Both transports are supported. **stdio** spawns a local binary (`StdioClientTransport`, env filtered through `getDefaultEnvironment()` plus the user's own vars). **http** tries Streamable HTTP and retries with SSE; the error reported is always the *first* transport's, because otherwise a 401 surfaces as the 404 the SSE `GET` gets back.
+- stdio pipes the child's **stderr** and buffers it (8 KB cap, drained immediately so a chatty server can't block). When startup fails, that text becomes the error message — it beats anything the protocol reports. A server that dies during the handshake only produces `-32000 Connection closed`, while its stderr says `Vault directory does not exist: /path`.
+- One connection per call — `connect` → call → `close`. No pool: it matches the one-shot model of the rest of the harness and avoids orphaned child processes between Next requests.
+- A failing MCP server degrades context; it never aborts the run. That's the one place MCP differs from `bridgeFn`: a missing `mcpFn` is logged as an integration error and execution continues.
+- **stdio runs an arbitrary local binary with full disk and network access.** Whoever can edit an agent can execute code on the host. `env` and `headers` (MCP tokens) are stored in cleartext in `data/agents.json`.
+
+Same bridge indirection as providers — `mcpFn` is injected, never imported from the engine, because `mcpClient.ts` uses `child_process`:
+
+| Caller | `mcpFn` |
+|---|---|
+| Browser | `fetchMcpBridge` (`src/lib/mcpBridgeClient.ts`) → `/api/mcp/call` |
+| Server routes, `telegramService` | `runMcpBridge` (`src/lib/mcpClient.ts`) |
+| `cli/harness.ts` | `directMcp` (`cli/cliEngine.ts`) |
+
+`parseMcpConfig()` (`src/lib/mcpConfigImport.ts`) backs the editor's "Pegar JSON" box: it ingests the `{"mcpServers": {…}}` block every MCP server publishes, in any of its three shapes (wrapped, bare map, single server). Hand-transcribing that block into the form fields is where configuration goes wrong — a package name and a path left on one line of the args textarea arrive as a single `argv` entry, and the resulting `npm ENOENT` names a path nobody typed. Importing keeps the array pre-split. Note that a path with spaces is a legitimate single argument, so a "looks glued together" heuristic can't be written without false-positiving on correct configs — that's why the fix is import, not detection.
+
+`/api/mcp/tools` lists a server's tools; it backs the modal's "Probar conexión" button so the user picks from the real catalog instead of typing names blind.
+
+`ThoughtStep.toolName` is typed to the local `ToolName` union, so MCP steps leave it undefined and carry their identity in `toolArgs` (`mcpServer`, `mcpTool`); `ExecutionPanel` labels them via `mcpStepLabel()`.
+
 ### Workflows
 
 `WorkflowConfig` is a linear chain: each step's `finalOutput` becomes the next step's prompt, prefixed by that step's optional `customInstruction`. `WorkflowBuilder` runs the chain client-side and writes each step to history; `/api/workflows/execute` implements the same pipeline server-side for programmatic callers. No branching, no parallelism.

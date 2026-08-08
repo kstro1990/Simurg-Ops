@@ -1,6 +1,7 @@
 import { AgentConfig, ExecutionRun, ProviderKeys } from '@/types/agent';
 import { runAgentEngine } from './agentEngine';
 import { runProviderBridge } from './providerBridge';
+import { listMcpTools, runMcpBridge } from './mcpClient';
 
 export interface TelegramBotInfo {
   id: number;
@@ -97,6 +98,8 @@ export async function processTelegramAgentRequest(options: {
       providerKeys,
       // Esto corre en el servidor: hay que invocar el puente directamente.
       bridgeFn: runProviderBridge,
+      mcpFn: runMcpBridge,
+      mcpListFn: listMcpTools,
     });
 
     const simulatedWarning = result.simulated

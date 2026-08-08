@@ -8,7 +8,9 @@
  */
 
 import { runProviderBridge } from '@/lib/providerBridge';
+import { listMcpTools, runMcpBridge } from '@/lib/mcpClient';
 import { BridgeRequest, BridgeResult } from '@/types/bridge';
+import { McpCallRequest, McpCallResult, McpListRequest, McpListResult } from '@/types/mcp';
 
 export type CliBridgeRequest = BridgeRequest;
 export type CliBridgeResponse = BridgeResult;
@@ -16,4 +18,17 @@ export type CliBridgeResponse = BridgeResult;
 /** Función de puente para el CLI: llama a las APIs y binarios directamente. */
 export async function directBridge(request: CliBridgeRequest): Promise<CliBridgeResponse> {
   return runProviderBridge(request);
+}
+
+/**
+ * Transporte MCP para el CLI. Mismo motivo que `directBridge`: en terminal no
+ * hay servidor HTTP al que reenviar, así que se llama a la implementación real.
+ */
+export async function directMcp(request: McpCallRequest): Promise<McpCallResult> {
+  return runMcpBridge(request);
+}
+
+/** Listado de tools MCP para el CLI; lo necesita el modo agéntico. */
+export async function directMcpList(request: McpListRequest): Promise<McpListResult> {
+  return listMcpTools(request);
 }

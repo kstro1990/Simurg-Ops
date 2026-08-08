@@ -3,6 +3,9 @@ import { tmpdir } from 'os';
 import { promisify } from 'util';
 import { AgentModel } from '@/types/agent';
 import { BridgeRequest, BridgeResult } from '@/types/bridge';
+import { McpTraceEntry, MCP_MAX_ITERATIONS } from '@/types/mcp';
+import { agenticServers, executeBoundTool, resolveAgenticTools } from './mcpTools';
+import { listMcpTools, runMcpBridge } from './mcpClient';
 
 const execFilePromise = promisify(execFile);
 
@@ -62,21 +65,18 @@ function errorMessage(err: unknown): string {
   return String(err);
 }
 
-async function callAnthropic(request: BridgeRequest, apiKey: string): Promise<BridgeResult> {
-  const anthropicModel = ANTHROPIC_MODEL_MAP[request.model] || 'claude-opus-5';
-  const maxTokens = Math.max(request.maxTokens, ANTHROPIC_MIN_MAX_TOKENS);
+interface AnthropicBlock {
+  type?: string;
+  text?: string;
+  id?: string;
+  name?: string;
+  input?: Record<string, unknown>;
+}
 
-  const body: Record<string, unknown> = {
-    model: anthropicModel,
-    max_tokens: maxTokens,
-    system: request.systemPrompt || undefined,
-    messages: [{ role: 'user', content: request.userPrompt }],
-  };
-
-  if (ANTHROPIC_TEMPERATURE_SUPPORTED.has(anthropicModel)) {
-    body.temperature = request.temperature;
-  }
-
+async function postAnthropic(
+  apiKey: string,
+  body: Record<string, unknown>
+): Promise<Record<string, unknown> & { content?: AnthropicBlock[] }> {
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
@@ -101,23 +101,134 @@ async function callAnthropic(request: BridgeRequest, apiKey: string): Promise<Br
     );
   }
 
-  const textBlock = Array.isArray(data.content)
-    ? data.content.find((block: { type?: string }) => block?.type === 'text')
-    : null;
-  const outputText = textBlock?.text?.trim();
+  return data;
+}
 
-  if (!outputText) {
-    throw new Error(`Anthropic devolvió una respuesta vacía (stop_reason: ${data.stop_reason}).`);
+function anthropicText(content: AnthropicBlock[] | undefined): string {
+  if (!Array.isArray(content)) return '';
+  return content
+    .filter((block) => block?.type === 'text' && typeof block.text === 'string')
+    .map((block) => block.text as string)
+    .join('\n')
+    .trim();
+}
+
+async function callAnthropic(request: BridgeRequest, apiKey: string): Promise<BridgeResult> {
+  const anthropicModel = ANTHROPIC_MODEL_MAP[request.model] || 'claude-opus-5';
+  const maxTokens = Math.max(request.maxTokens, ANTHROPIC_MIN_MAX_TOKENS);
+
+  // --- Modo agéntico: se le ofrecen las tools MCP y el modelo decide ---
+  const servers = agenticServers(request.mcpServers);
+  const { tools, failures } = servers.length
+    ? await resolveAgenticTools(servers, listMcpTools)
+    : { tools: [], failures: [] as string[] };
+
+  const byAlias = new Map(tools.map((tool) => [tool.alias, tool]));
+  const toolTrace: McpTraceEntry[] = [];
+
+  // Los bloques del asistente se devuelven **sin tocar**: en Opus 5 el
+  // pensamiento va dentro y editarlo rompe el turno.
+  const messages: Array<{ role: string; content: unknown }> = [
+    { role: 'user', content: request.userPrompt },
+  ];
+
+  let promptTokens = 0;
+  let completionTokens = 0;
+
+  for (let iteration = 0; iteration < MCP_MAX_ITERATIONS; iteration++) {
+    const body: Record<string, unknown> = {
+      model: anthropicModel,
+      max_tokens: maxTokens,
+      system: request.systemPrompt || undefined,
+      messages,
+    };
+
+    if (ANTHROPIC_TEMPERATURE_SUPPORTED.has(anthropicModel)) {
+      body.temperature = request.temperature;
+    }
+
+    if (tools.length > 0) {
+      body.tools = tools.map((tool) => ({
+        name: tool.alias,
+        description: tool.description,
+        input_schema: tool.inputSchema,
+      }));
+    }
+
+    const data = await postAnthropic(apiKey, body);
+    promptTokens += (data.usage as { input_tokens?: number })?.input_tokens ?? 0;
+    completionTokens += (data.usage as { output_tokens?: number })?.output_tokens ?? 0;
+
+    const toolUses = (data.content ?? []).filter((block) => block?.type === 'tool_use');
+
+    if (data.stop_reason !== 'tool_use' || toolUses.length === 0) {
+      const outputText = anthropicText(data.content);
+      if (!outputText) {
+        throw new Error(
+          `Anthropic devolvió una respuesta vacía (stop_reason: ${data.stop_reason}).`
+        );
+      }
+      return {
+        success: true,
+        output: outputText,
+        source: 'api',
+        usage: { promptTokens, completionTokens },
+        toolTrace: toolTrace.length ? toolTrace : undefined,
+      };
+    }
+
+    // El turno del asistente entero, incluidos los bloques de pensamiento.
+    messages.push({ role: 'assistant', content: data.content });
+
+    // Todos los `tool_result` van en UN solo mensaje de usuario: repartirlos
+    // enseña al modelo a dejar de pedir tools en paralelo.
+    const results = [];
+    for (const use of toolUses) {
+      const tool = byAlias.get(use.name ?? '');
+      const args = (use.input ?? {}) as Record<string, unknown>;
+
+      if (!tool) {
+        results.push({
+          type: 'tool_result',
+          tool_use_id: use.id,
+          content: `La tool "${use.name}" no está disponible.`,
+          is_error: true,
+        });
+        continue;
+      }
+
+      const result = await executeBoundTool(tool, args, runMcpBridge);
+      const text = result.success
+        ? result.output || '(sin contenido)'
+        : result.message || 'La tool falló sin detalle.';
+
+      toolTrace.push({
+        server: tool.server.name || tool.server.id,
+        tool: tool.toolName,
+        arguments: args,
+        ok: Boolean(result.success),
+        output: result.success ? text : undefined,
+        message: result.success ? undefined : text,
+      });
+
+      results.push({
+        type: 'tool_result',
+        tool_use_id: use.id,
+        content: text,
+        is_error: !result.success,
+      });
+    }
+
+    messages.push({ role: 'user', content: results });
   }
 
+  // Se agotaron las vueltas: se devuelve lo último que dijo con una nota, en vez
+  // de perder el trabajo hecho.
+  const detail = failures.length ? ` Además: ${failures.join(' ')}` : '';
   return {
-    success: true,
-    output: outputText,
-    source: 'api',
-    usage: {
-      promptTokens: data.usage?.input_tokens ?? 0,
-      completionTokens: data.usage?.output_tokens ?? 0,
-    },
+    success: false,
+    message: `El bucle de tools se detuvo tras ${MCP_MAX_ITERATIONS} vueltas sin respuesta final.${detail}`,
+    toolTrace: toolTrace.length ? toolTrace : undefined,
   };
 }
 

@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { runAgentEngine } from '@/lib/agentEngine';
 import { runProviderBridge } from '@/lib/providerBridge';
+import { listMcpTools, runMcpBridge } from '@/lib/mcpClient';
 import { getStoredSettings } from '@/lib/serverStorage';
 import { AgentConfig, ProviderKeys } from '@/types/agent';
 
@@ -28,6 +29,8 @@ export async function POST(req: NextRequest) {
       // En el servidor se invoca el puente directamente: un fetch relativo no
       // resolvería y la ejecución caería silenciosamente al simulador.
       bridgeFn: runProviderBridge,
+      mcpFn: runMcpBridge,
+      mcpListFn: listMcpTools,
     });
 
     return NextResponse.json({
