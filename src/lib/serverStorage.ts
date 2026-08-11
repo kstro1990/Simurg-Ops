@@ -87,9 +87,20 @@ async function readJson<T>(file: string): Promise<ReadResult<T>> {
 
 // --- AGENTES ---
 
-/** Reasigna modelos retirados para que los agentes guardados sigan funcionando. */
+/**
+ * Reasigna modelos retirados para que los agentes guardados sigan funcionando y
+ * poda la clave `tools` del registro local, ya retirado. La poda no es
+ * imprescindible en runtime (JSON parseado, sin comprobación de propiedades
+ * extra) pero evita arrastrar indefinidamente una lista que ya no significa nada.
+ */
 function migrateAgents(agents: AgentConfig[]): AgentConfig[] {
-  return agents.map((agent) => ({ ...agent, model: normalizeModel(agent.model) }));
+  return agents.map((agent) => {
+    const migrated = { ...agent, model: normalizeModel(agent.model) } as AgentConfig & {
+      tools?: unknown;
+    };
+    delete migrated.tools;
+    return migrated;
+  });
 }
 
 export async function getStoredAgents(): Promise<AgentConfig[]> {

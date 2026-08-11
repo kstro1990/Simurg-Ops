@@ -188,46 +188,58 @@ async function callAnthropic(request: BridgeRequest, apiKey: string): Promise<Br
     // El turno del asistente entero, incluidos los bloques de pensamiento.
     messages.push({ role: 'assistant', content: data.content });
 
-    // Todos los `tool_result` van en UN solo mensaje de usuario: repartirlos
-    // enseña al modelo a dejar de pedir tools en paralelo.
-    const results = [];
-    for (const use of toolUses) {
-      const tool = byAlias.get(use.name ?? '');
-      const args = (use.input ?? {}) as Record<string, unknown>;
+    // Cuando el modelo pide varias tools en la misma vuelta se ejecutan a la vez:
+    // son llamadas independientes y cada una abre su propia conexión MCP, así que
+    // encadenarlas solo sumaba latencia. El orden se conserva porque `Promise.all`
+    // devuelve los resultados en el orden de entrada.
+    const settled = await Promise.all(
+      toolUses.map(async (use) => {
+        const tool = byAlias.get(use.name ?? '');
+        const args = (use.input ?? {}) as Record<string, unknown>;
 
-      if (!tool) {
-        results.push({
-          type: 'tool_result',
-          tool_use_id: use.id,
-          content: `La tool "${use.name}" no está disponible.`,
-          is_error: true,
-        });
-        continue;
-      }
+        if (!tool) {
+          return {
+            block: {
+              type: 'tool_result',
+              tool_use_id: use.id,
+              content: `La tool "${use.name}" no está disponible.`,
+              is_error: true,
+            },
+            trace: undefined,
+          };
+        }
 
-      const result = await executeBoundTool(tool, args, runMcpBridge);
-      const text = result.success
-        ? result.output || '(sin contenido)'
-        : result.message || 'La tool falló sin detalle.';
+        const result = await executeBoundTool(tool, args, runMcpBridge);
+        const text = result.success
+          ? result.output || '(sin contenido)'
+          : result.message || 'La tool falló sin detalle.';
 
-      toolTrace.push({
-        server: tool.server.name || tool.server.id,
-        tool: tool.toolName,
-        arguments: args,
-        ok: Boolean(result.success),
-        output: result.success ? text : undefined,
-        message: result.success ? undefined : text,
-      });
+        return {
+          block: {
+            type: 'tool_result',
+            tool_use_id: use.id,
+            content: text,
+            is_error: !result.success,
+          },
+          trace: {
+            server: tool.server.name || tool.server.id,
+            tool: tool.toolName,
+            arguments: args,
+            ok: Boolean(result.success),
+            output: result.success ? text : undefined,
+            message: result.success ? undefined : text,
+          } as McpTraceEntry,
+        };
+      })
+    );
 
-      results.push({
-        type: 'tool_result',
-        tool_use_id: use.id,
-        content: text,
-        is_error: !result.success,
-      });
+    for (const entry of settled) {
+      if (entry.trace) toolTrace.push(entry.trace);
     }
 
-    messages.push({ role: 'user', content: results });
+    // Todos los `tool_result` van en UN solo mensaje de usuario: repartirlos
+    // enseña al modelo a dejar de pedir tools en paralelo.
+    messages.push({ role: 'user', content: settled.map((entry) => entry.block) });
   }
 
   // Se agotaron las vueltas: se devuelve lo último que dijo con una nota, en vez

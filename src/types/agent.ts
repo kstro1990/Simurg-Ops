@@ -103,8 +103,6 @@ export function getProviderFromModel(model: AgentModel): AIProvider {
 }
 
 
-export type ToolName = 'web_search' | 'code_executor' | 'image_generator' | 'data_extractor';
-
 export interface TelegramConfig {
   enabled: boolean;
   botToken?: string;
@@ -125,7 +123,6 @@ export interface AgentConfig {
   systemPrompt: string;
   temperature: number;
   maxTokens: number;
-  tools: ToolName[];
   /**
    * Turnos previos (user + assistant) que se reinyectan como contexto en cada
    * ejecución. 0 = sin memoria (el comportamiento one-shot original). Ausente
@@ -146,7 +143,13 @@ export interface ThoughtStep {
   type: StepType;
   content: string;
   timestamp: string;
-  toolName?: ToolName;
+  /**
+   * Identificador libre de la herramienta. Antes estaba tipado con el registro
+   * local `ToolName`, ya retirado; se mantiene como string para que el historial
+   * ya guardado en `data/history.json` siga renderizando. Los pasos MCP no lo
+   * usan: llevan su identidad en `toolArgs` (`mcpServer`, `mcpTool`).
+   */
+  toolName?: string;
   toolArgs?: Record<string, unknown>;
   toolResult?: string;
 }

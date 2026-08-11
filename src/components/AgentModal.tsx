@@ -1,11 +1,10 @@
 'use client';
 
 import React, { useState } from 'react';
-import { AgentConfig, AgentModel, DEFAULT_MODEL, ToolName } from '@/types/agent';
+import { AgentConfig, AgentModel, DEFAULT_MODEL } from '@/types/agent';
 import { MAX_MEMORY_TURNS, resolveMemoryTurns } from '@/types/conversation';
 import { McpServerConfig } from '@/types/mcp';
-import { X, Wrench, Cpu, Check } from 'lucide-react';
-import { TOOLS } from '@/lib/tools';
+import { X, Wrench, Cpu } from 'lucide-react';
 import { McpServerEditor } from './McpServerEditor';
 
 interface AgentModalProps {
@@ -16,7 +15,6 @@ interface AgentModalProps {
 
 const EMOJI_OPTIONS = ['🤖', '🕵️', '💻', '🔍', '✍️', '🎨', '🧠', '⚡', '🚀', '📊', '🛡️', '⚙️'];
 
-const DEFAULT_TOOLS: ToolName[] = ['web_search'];
 const DEFAULT_SYSTEM_PROMPT =
   'Eres un agente autónomo de IA diseñado para asistir al usuario de manera precisa y eficiente.';
 
@@ -73,16 +71,7 @@ export const AgentModal: React.FC<AgentModalProps> = ({ onClose, onSave, initial
   const [temperature, setTemperature] = useState(initialAgent?.temperature ?? 0.3);
   const [maxTokens, setMaxTokens] = useState(initialAgent?.maxTokens ?? 2048);
   const [memoryTurns, setMemoryTurns] = useState(resolveMemoryTurns(initialAgent?.memoryTurns));
-  const [selectedTools, setSelectedTools] = useState<ToolName[]>(
-    initialAgent?.tools ?? DEFAULT_TOOLS
-  );
   const [mcpServers, setMcpServers] = useState<McpServerConfig[]>(initialAgent?.mcpServers ?? []);
-
-  const toggleTool = (toolName: ToolName) => {
-    setSelectedTools((prev) =>
-      prev.includes(toolName) ? prev.filter((t) => t !== toolName) : [...prev, toolName]
-    );
-  };
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -105,7 +94,6 @@ export const AgentModal: React.FC<AgentModalProps> = ({ onClose, onSave, initial
       systemPrompt: systemPrompt.trim(),
       temperature,
       maxTokens: safeMaxTokens,
-      tools: selectedTools,
       memoryTurns: resolveMemoryTurns(memoryTurns),
       mcpServers,
       // Este modal no edita el enrolamiento de Telegram: hay que arrastrarlo,
@@ -289,40 +277,14 @@ export const AgentModal: React.FC<AgentModalProps> = ({ onClose, onSave, initial
             />
           </div>
 
-          <div>
+          {/* Las herramientas del agente son sus servidores MCP. El registro
+              local de tools se retiró: devolvía datos simulados y no dejaba
+              elegir al modelo. */}
+          <div className="pt-2 border-t border-white/10">
             <span className="flex items-center gap-1.5 text-xs font-semibold text-slate-300 mb-2">
               <Wrench className="w-4 h-4 text-indigo-400" />
               Herramientas de Agente Habilitadas
             </span>
-            <div className="grid grid-cols-2 gap-3">
-              {Object.values(TOOLS).map((tool) => {
-                const isSelected = selectedTools.includes(tool.name);
-                return (
-                  <button
-                    type="button"
-                    key={tool.name}
-                    onClick={() => toggleTool(tool.name)}
-                    className={`flex items-start gap-3 p-3 rounded-xl border text-left transition-all ${
-                      isSelected
-                        ? 'bg-indigo-500/15 border-indigo-500/40 text-slate-100'
-                        : 'bg-slate-900/40 border-white/5 text-slate-400 hover:bg-slate-900/80'
-                    }`}
-                  >
-                    <div className="text-xl mt-0.5">{tool.icon}</div>
-                    <div className="flex-1">
-                      <div className="flex items-center justify-between">
-                        <span className="text-xs font-bold text-slate-200">{tool.displayName}</span>
-                        {isSelected && <Check className="w-3.5 h-3.5 text-indigo-400" />}
-                      </div>
-                      <p className="text-[10px] text-slate-400 mt-0.5">{tool.description}</p>
-                    </div>
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-
-          <div className="pt-2 border-t border-white/10">
             <McpServerEditor servers={mcpServers} onChange={setMcpServers} />
           </div>
 

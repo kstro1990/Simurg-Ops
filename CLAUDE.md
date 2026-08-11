@@ -109,11 +109,17 @@ Each agent carries its own `telegramConfig` (one agent ↔ one bot). Enrolment r
 - **Webhook** — `/api/telegram/webhook?agentId=<id>` loads the real stored agent and its token. It never accepts credentials via query string. Set `TELEGRAM_WEBHOOK_SECRET` to require Telegram's `X-Telegram-Bot-Api-Secret-Token` header.
 - **Conversation** — one thread per `chat.id`. `processTelegramAgentRequest` returns `ExecutionRun | null`, `null` meaning the message was a command (`/nuevo`, `/start`, `/ayuda`) so there is no run to record — every call site needs the `if (run)` guard. `parseTelegramCommand()` tolerates the `@bot` suffix Telegram appends in groups; matching `text === '/nuevo'` would treat it as a prompt.
 
-### Tools
+### Tools: MCP is the only mechanism
 
-`src/lib/tools.ts` are pre-flight prompt enrichers, not model-driven tool calls: every tool on an agent runs unconditionally before generation and its JSON output is appended to the prompt. Each definition carries a `simulated` flag — `web_search`, `image_generator`, and `data_extractor` return labelled placeholder data. `code_executor` really runs JavaScript via `new Function`, **in-process and unsandboxed**; it only executes when an explicit `code` argument is supplied.
+There is no local tool registry. `src/lib/tools.ts` and the `ToolName` union were **removed**, and with them the "Herramientas de Agente Habilitadas" checkbox grid — that heading now sits on top of `McpServerEditor` in `AgentModal`, and `AgentCard` lists a tool as the MCP server it comes from, tagged with its mode. Do not reintroduce a parallel tool path; add tools as MCP servers. Web search, the one capability the old registry pretended to have, comes from a search MCP server (Tavily, Brave, …) in `agentic` mode — paste its `mcpServers` block into `McpServerEditor` — or from the provider's own native search on Gemini/Anthropic.
 
-`runTools()` in `agentEngine.ts` memoizes its result. It used to run once on the real-provider path and again in the simulator fallback — harmless for the placeholder tools, but with MCP that meant spawning processes and hitting remote APIs twice per request.
+The old registry was removed because none of it worked: `web_search`, `image_generator` and `data_extractor` returned labelled placeholder JSON, and `code_executor` — the only real one, a `new Function` with no sandbox — was unreachable, because `runLocalTools()` only ever passed `{query, prompt, text}` and the tool needs an explicit `code` argument. On top of that, nothing was model-driven: every enabled tool ran before generation with the user's prompt as every argument, and its output was appended to the real prompt as `[CONTEXT FROM TOOL: …]`, so agents paid tokens to be told the data was invented. MCP's `agentic` mode already does this properly.
+
+`AgentConfig.tools` is gone; `migrateAgents()` in `serverStorage.ts` deletes the orphan key from stored agents and persists the pruned version. `ThoughtStep.toolName` was **kept**, retyped from `ToolName` to `string`, so entries already in `data/history.json` still render — MCP steps leave it undefined and carry their identity in `toolArgs`.
+
+`runTools()` in `agentEngine.ts` now just wraps the pre-flight MCP pass, but keeps memoizing: it used to run once on the real-provider path and again in the simulator fallback, which with MCP meant spawning processes and hitting remote APIs twice per request.
+
+When a model asks for several tools in one turn, both agentic loops resolve them with `Promise.all` — they are independent calls, each opening its own MCP connection. Ordering of the trace is preserved deliberately: in `agentEngine.ts` the `tool_call` step is emitted before the first `await` and `runAgenticTool` **returns** its result step instead of emitting it, so the caller can add them in request order rather than completion order.
 
 ### MCP: one server set per agent
 
@@ -121,7 +127,7 @@ Each agent carries its own `mcpServers: McpServerConfig[]` (`src/types/mcp.ts`),
 
 Each server picks a `mode`:
 
-- **`preflight`** (default, and what a stored server without the field gets) — pre-flight enricher, like `tools.ts`. The model never sees a schema: the user declares which tools to invoke and with what arguments, they all run before generation, and the output is appended as `[CONTEXT FROM MCP: <server> / <tool>]`. Works on every provider. Never put write tools here — they'd run on every message with fixed arguments.
+- **`preflight`** (default, and what a stored server without the field gets) — pre-flight prompt enricher. The model never sees a schema: the user declares which tools to invoke and with what arguments, they all run before generation, and the output is appended as `[CONTEXT FROM MCP: <server> / <tool>]`. Works on every provider. Never put write tools here — they'd run on every message with fixed arguments.
 - **`agentic`** — real tool-calling. Schemas go to the model, it picks the tool and the arguments, the result is fed back, and it iterates up to `MCP_MAX_ITERATIONS`. This is the only mode that makes write tools useful, because they run only when the model asks.
 
 Agentic mode needs a provider with a tool-call channel: **Gemini** (loop in `agentEngine.ts`, using the injected `mcpFn`/`mcpListFn`) and **Anthropic by API** (loop inside `providerBridge.ts`, which is server-only and imports `mcpClient` directly, so conversation state never crosses the browser/server boundary). `copilot-cli` and `openai` are not wired; `claude-code` only qualifies when an Anthropic API key routes it to the API instead of the `claude -p` binary. The engine emits an explicit error step when an agent asks for agentic mode on a provider that can't do it — silent degradation would look like the tools simply doing nothing.

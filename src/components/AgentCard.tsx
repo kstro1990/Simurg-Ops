@@ -3,7 +3,6 @@
 import React from 'react';
 import { AgentConfig } from '@/types/agent';
 import { Play, Edit3, Trash2, Copy, Cpu, Wrench, Send } from 'lucide-react';
-import { TOOLS } from '@/lib/tools';
 
 interface AgentCardProps {
   agent: AgentConfig;
@@ -22,6 +21,7 @@ export const AgentCard: React.FC<AgentCardProps> = ({
   onDelete,
   onOpenTelegramModal,
 }) => {
+  const enabledMcpServers = (agent.mcpServers ?? []).filter((server) => server.enabled);
   const isTelegramConnected =
     agent.telegramConfig?.enabled && agent.telegramConfig?.status === 'connected';
   const botUsername = agent.telegramConfig?.botUsername;
@@ -84,28 +84,33 @@ export const AgentCard: React.FC<AgentCardProps> = ({
           {agent.description}
         </p>
 
-        {/* Active Tools List */}
+        {/* Herramientas activas = servidores MCP habilitados. El modo es lo que
+            de verdad cambia el comportamiento: `agentic` deja elegir al modelo,
+            `preflight` ejecuta llamadas fijas antes de generar. */}
         <div className="mb-4">
           <div className="flex items-center gap-1 text-[11px] text-slate-400 font-medium mb-1.5">
             <Wrench className="w-3 h-3 text-slate-400" />
-            <span>Herramientas Activas ({agent.tools.length}):</span>
+            <span>Herramientas Activas ({enabledMcpServers.length}):</span>
           </div>
           <div className="flex flex-wrap gap-1.5">
-            {agent.tools.length > 0 ? (
-              agent.tools.map((toolName) => {
-                const toolDef = TOOLS[toolName];
-                return (
-                  <span
-                    key={toolName}
-                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-medium bg-slate-900/80 text-slate-300 border border-white/10"
-                  >
-                    <span>{toolDef?.icon || '⚙️'}</span>
-                    <span>{toolDef?.displayName || toolName}</span>
+            {enabledMcpServers.length > 0 ? (
+              enabledMcpServers.map((server) => (
+                <span
+                  key={server.id}
+                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-medium bg-slate-900/80 text-slate-300 border border-white/10"
+                  title={`Transporte: ${server.transport}`}
+                >
+                  <span>{server.mode === 'agentic' ? '🧠' : '📎'}</span>
+                  <span>{server.name || server.id}</span>
+                  <span className="text-slate-400">
+                    {server.mode === 'agentic' ? 'agéntico' : 'pre-flight'}
                   </span>
-                );
-              })
+                </span>
+              ))
             ) : (
-              <span className="text-[10px] text-slate-400 italic">Sin herramientas asignadas</span>
+              <span className="text-[10px] text-slate-400 italic">
+                Sin servidores MCP habilitados
+              </span>
             )}
           </div>
         </div>

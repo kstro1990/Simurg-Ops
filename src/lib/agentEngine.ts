@@ -15,7 +15,6 @@ import {
 import { McpBoundTool, McpFn, McpListFn, MCP_MAX_ITERATIONS } from '@/types/mcp';
 import { toGeminiContents } from './conversationFormat';
 import { agenticServers, executeBoundTool, preflightServers, resolveAgenticTools } from './mcpTools';
-import { TOOLS } from './tools';
 import { GoogleGenAI } from '@google/genai';
 
 export type { BridgeRequest, BridgeResult, BridgeFn } from '@/types/bridge';
@@ -140,54 +139,14 @@ export async function runAgentEngine(options: ExecuteAgentOptions): Promise<Agen
    */
   let toolContextCache: string | null = null;
 
-  /** Herramientas locales de `lib/tools.ts` (registro cerrado). */
-  const runLocalTools = async (): Promise<string> => {
-    if (!agent.tools || agent.tools.length === 0) return '';
-
-    addStep({
-      type: 'thought',
-      content: `Herramientas activas asignadas a este agente: ${agent.tools.join(', ')}. Recopilando contexto...`,
-    });
-
-    let context = '';
-    for (const toolName of agent.tools) {
-      const toolDef = TOOLS[toolName];
-      if (!toolDef) continue;
-
-      addStep({
-        type: 'tool_call',
-        toolName,
-        content: `Ejecutando herramienta [${toolDef.displayName}]...`,
-        toolArgs: { query: userPrompt, prompt: userPrompt, text: userPrompt },
-      });
-
-      const toolResult = await toolDef.execute({
-        query: userPrompt,
-        prompt: userPrompt,
-        text: userPrompt,
-      });
-
-      addStep({
-        type: 'tool_result',
-        toolName,
-        content: `Resultado obtenido de ${toolDef.displayName}`,
-        toolResult,
-      });
-
-      context += `\n\n[CONTEXT FROM TOOL: ${toolDef.displayName}]:\n${toolResult}`;
-    }
-    return context;
-  };
-
   /**
-   * Servidores MCP del agente. Son enriquecedores pre-flight, igual que las
-   * herramientas locales: se invocan las tools que el usuario declaró y su
-   * salida se anexa al prompt. Un servidor caído degrada el contexto, nunca
-   * tumba la ejecución.
+   * Servidores MCP del agente en modo pre-flight: se invocan las tools que el
+   * usuario declaró y su salida se anexa al prompt. Un servidor caído degrada el
+   * contexto, nunca tumba la ejecución.
    *
-   * `ThoughtStep.toolName` está tipado como `ToolName` (registro local), así que
-   * los pasos MCP lo dejan sin definir y llevan la identidad en `content` y
-   * `toolArgs`.
+   * MCP es el único mecanismo de herramientas que queda. El registro local de
+   * `lib/tools.ts` se retiró: tres de sus cuatro tools devolvían datos
+   * inventados y la cuarta era inalcanzable, y ninguna dejaba elegir al modelo.
    */
   const runMcpServers = async (): Promise<string> => {
     const servers = preflightServers(agent.mcpServers);
@@ -252,7 +211,7 @@ export async function runAgentEngine(options: ExecuteAgentOptions): Promise<Agen
   /** Ejecuta las herramientas del agente y devuelve el contexto recopilado. */
   const runTools = async (): Promise<string> => {
     if (toolContextCache !== null) return toolContextCache;
-    const context = (await runLocalTools()) + (await runMcpServers());
+    const context = await runMcpServers();
     toolContextCache = context;
     return context;
   };
@@ -291,24 +250,32 @@ export async function runAgentEngine(options: ExecuteAgentOptions): Promise<Agen
     return tools;
   };
 
-  /** Ejecuta la tool que pidió el modelo y devuelve el texto para realimentarlo. */
+  /**
+   * Ejecuta la tool que pidió el modelo y devuelve el texto para realimentarlo.
+   *
+   * Emite el paso `tool_call` de forma síncrona (antes del primer `await`) y
+   * devuelve el paso de resultado sin emitirlo, para que quien llame lo haga en
+   * el orden en que el modelo pidió las tools y no en el que terminen. Con
+   * ejecución en paralelo, emitirlo aquí dentro entrelazaría la traza.
+   */
   const runAgenticTool = async (
     tools: McpBoundTool[],
     alias: string,
     args: Record<string, unknown>
-  ): Promise<string> => {
+  ): Promise<{ text: string; resultStep: Omit<ThoughtStep, 'id' | 'timestamp'> }> => {
     const tool = tools.find((candidate) => candidate.alias === alias);
     if (!tool || !mcpFn) {
       const detail = `El modelo pidió la tool "${alias}", que no está disponible.`;
-      addStep({ type: 'error', content: detail });
-      return detail;
+      return { text: detail, resultStep: { type: 'error', content: detail } };
     }
+
+    const label = tool.server.name || tool.server.id;
 
     addStep({
       type: 'tool_call',
-      content: `El modelo llama a MCP [${tool.server.name || tool.server.id}] → ${tool.toolName}`,
+      content: `El modelo llama a MCP [${label}] → ${tool.toolName}`,
       toolArgs: {
-        mcpServer: tool.server.name || tool.server.id,
+        mcpServer: label,
         mcpTool: tool.toolName,
         arguments: args,
       },
@@ -319,20 +286,17 @@ export async function runAgentEngine(options: ExecuteAgentOptions): Promise<Agen
       ? result.output || '(sin contenido)'
       : result.message || 'La tool falló sin detalle.';
 
-    addStep({
-      type: result.success ? 'tool_result' : 'error',
-      content: result.success
-        ? `Resultado de MCP [${tool.server.name || tool.server.id}] → ${tool.toolName}`
-        : text,
-      toolResult: result.success ? text : undefined,
-      toolArgs: {
-        mcpServer: tool.server.name || tool.server.id,
-        mcpTool: tool.toolName,
-      },
-    });
-
     if (!result.success) failures.push(text);
-    return text;
+
+    return {
+      text,
+      resultStep: {
+        type: result.success ? 'tool_result' : 'error',
+        content: result.success ? `Resultado de MCP [${label}] → ${tool.toolName}` : text,
+        toolResult: result.success ? text : undefined,
+        toolArgs: { mcpServer: label, mcpTool: tool.toolName },
+      },
+    };
   };
 
   // --- 1. MOTOR GEMINI ---
@@ -425,17 +389,29 @@ export async function runAgentEngine(options: ExecuteAgentOptions): Promise<Agen
                 }
           );
 
-          const responses = [];
-          for (const call of calls) {
-            const output = await runAgenticTool(
-              agenticTools,
-              call.name ?? '',
-              (call.args ?? {}) as Record<string, unknown>
-            );
-            responses.push({
-              functionResponse: { name: call.name, response: { result: output } },
-            });
-          }
+          // Gemini puede pedir varias tools en la misma vuelta. Son llamadas
+          // independientes, así que se lanzan a la vez; los pasos `tool_call` se
+          // emiten en orden porque `runAgenticTool` los añade antes de su primer
+          // `await`, y los de resultado se emiten aquí, también en orden.
+          const executed = await Promise.all(
+            calls.map((call) =>
+              runAgenticTool(
+                agenticTools,
+                call.name ?? '',
+                (call.args ?? {}) as Record<string, unknown>
+              )
+            )
+          );
+
+          const responses = executed.map((entry, index) => {
+            addStep(entry.resultStep);
+            return {
+              functionResponse: {
+                name: calls[index].name,
+                response: { result: entry.text },
+              },
+            };
+          });
           contents.push({ role: 'user', parts: responses });
         }
 
