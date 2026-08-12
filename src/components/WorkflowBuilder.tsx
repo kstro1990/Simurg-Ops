@@ -25,7 +25,13 @@ import {
   FlaskConical,
   Send,
 } from 'lucide-react';
-import { indexAgents, runWorkflowPipeline, workflowStepToRun } from '@/lib/workflowEngine';
+import {
+  indexAgents,
+  runWorkflowPipeline,
+  workflowStepRunId,
+  workflowStepToRun,
+} from '@/lib/workflowEngine';
+import { newTraceId, postLiveEvent } from '@/lib/liveEventsClient';
 import { fetchProviderBridge } from '@/lib/bridgeClient';
 import { fetchMcpBridge, fetchMcpTools } from '@/lib/mcpBridgeClient';
 import { Markdown } from './Markdown';
@@ -106,6 +112,22 @@ export const WorkflowBuilder: React.FC<WorkflowBuilderProps> = ({
     setPipelineResults([]);
     setRunError(null);
 
+    // El motor corre en el navegador, así que el monitor en vivo se alimenta
+    // por HTTP. Es telemetría: si falla, la ejecución no se entera.
+    const traceId = newTraceId();
+    const timestamp = new Date().toISOString();
+    postLiveEvent({
+      traceId,
+      type: 'run_start',
+      source: 'web',
+      targetKind: 'workflow',
+      targetId: selectedWorkflow.id,
+      targetName: selectedWorkflow.name,
+      targetAvatar: '🔗',
+      prompt: initialPrompt.trim(),
+      totalSteps: selectedWorkflow.steps.length,
+    });
+
     try {
       const pipeline = await runWorkflowPipeline({
         workflow: selectedWorkflow,
@@ -117,13 +139,42 @@ export const WorkflowBuilder: React.FC<WorkflowBuilderProps> = ({
         mcpFn: fetchMcpBridge,
         mcpListFn: fetchMcpTools,
         signal: controller.signal,
-        onStepStart: setActiveStepIndex,
+        onStepStart: (index) => {
+          setActiveStepIndex(index);
+          const step = selectedWorkflow.steps[index];
+          const agent = agentsMap[step.agentId];
+          postLiveEvent({
+            traceId,
+            type: 'step_start',
+            index,
+            stepName: step.stepName,
+            agentName: agent?.name ?? step.agentId,
+            agentAvatar: agent?.avatar ?? '⚠️',
+          });
+        },
+        onAgentStep: (step, index) => postLiveEvent({ traceId, type: 'thought', index, step }),
         onStepResult: (result, index) => {
           setPipelineResults((prev) => [...prev, result]);
+          postLiveEvent({
+            traceId,
+            type: 'step_result',
+            index,
+            stepName: result.stepName,
+            agentName: result.agentName,
+            agentAvatar: result.agentAvatar,
+            status: result.status,
+            output: result.output,
+            metrics: result.metrics ?? undefined,
+            simulated: result.simulated,
+            ...(result.error ? { error: result.error } : {}),
+            ...(result.status === 'skipped'
+              ? {}
+              : { runId: workflowStepRunId(timestamp, index) }),
+          });
           // Cada paso queda en el historial: antes los workflows no dejaban
           // rastro. Los omitidos no se registran, no hubo ejecución.
           if (result.status !== 'skipped') {
-            onSaveRunHistory(workflowStepToRun(result, index));
+            onSaveRunHistory(workflowStepToRun(result, index, { timestamp }));
           }
         },
       });
@@ -133,11 +184,31 @@ export const WorkflowBuilder: React.FC<WorkflowBuilderProps> = ({
       } else if (pipeline.aborted) {
         setRunError('Pipeline detenido por el usuario.');
       }
+
+      postLiveEvent({
+        traceId,
+        type: 'run_end',
+        status: pipeline.failed ? 'failed' : pipeline.aborted ? 'aborted' : 'completed',
+        finalOutput: pipeline.finalOutput,
+        simulated: pipeline.simulated,
+        ...(pipeline.failed
+          ? { error: pipeline.stepResults.at(-1)?.error ?? 'El pipeline falló.' }
+          : {}),
+      });
     } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      postLiveEvent({
+        traceId,
+        type: 'run_end',
+        status: 'failed',
+        finalOutput: message,
+        simulated: false,
+        error: message,
+      });
       // Salvaguarda: `runWorkflowPipeline` ya captura los fallos por paso, pero
       // sin este catch un error inesperado dejaría isRunning en true para
       // siempre y el botón bloqueado hasta recargar la página.
-      setRunError(err instanceof Error ? err.message : String(err));
+      setRunError(message);
     } finally {
       abortRef.current = null;
       setActiveStepIndex(null);

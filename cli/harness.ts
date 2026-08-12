@@ -14,7 +14,9 @@
 import * as path from 'path';
 import * as fs from 'fs';
 import { execFileSync } from 'child_process';
+import { randomUUID } from 'crypto';
 import { AgentConfig, ProviderKeys, getProviderFromModel } from '@/types/agent';
+import type { LiveEventInput } from '@/types/liveEvent';
 import { runAgentEngine } from '@/lib/agentEngine';
 import { DEFAULT_AGENTS } from '@/lib/presets';
 import { directBridge, directMcp, directMcpList } from './cliEngine';
@@ -106,11 +108,46 @@ function getProviderKeysFromEnv(): ProviderKeys {
   };
 }
 
+// ── Live monitor (opt-in) ─────────────────────────────────────────────
+
+/**
+ * Emite al monitor en vivo de la web, si hay un servidor al que hablar.
+ *
+ * Opt-in por `HARNESS_EVENTS_URL`: sin la variable el CLI no intenta ninguna
+ * conexión, para que usarlo sin `npm run dev` levantado siga siendo igual de
+ * rápido y no imprima errores. Nunca se espera ni se propaga el fallo.
+ */
+function postLiveEvent(event: LiveEventInput): void {
+  const base = process.env.HARNESS_EVENTS_URL;
+  if (!base) return;
+
+  void fetch(`${base.replace(/\/$/, '')}/api/events/publish`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(event),
+    signal: AbortSignal.timeout(500),
+  }).catch(() => {
+    /* el monitor es un extra: nunca puede afectar a la ejecución */
+  });
+}
+
 // ── Execute agent ─────────────────────────────────────────────────────
 
 async function executeAgent(agent: AgentConfig, userPrompt: string): Promise<void> {
   const providerKeys = getProviderKeysFromEnv();
   const provider = getProviderFromModel(agent.model);
+  const traceId = randomUUID();
+
+  postLiveEvent({
+    traceId,
+    type: 'run_start',
+    source: 'cli',
+    targetKind: 'agent',
+    targetId: agent.id,
+    targetName: agent.name,
+    targetAvatar: agent.avatar,
+    prompt: userPrompt,
+  });
 
   console.log('');
   console.log(`  ${c(colors.bold + colors.brightWhite, `Executing: ${agent.avatar} ${agent.name}`)}`);
@@ -130,6 +167,7 @@ async function executeAgent(agent: AgentConfig, userPrompt: string): Promise<voi
       mcpFn: directMcp,
       mcpListFn: directMcpList,
       onStepUpdate: (step) => {
+        postLiveEvent({ traceId, type: 'thought', step });
         spinner.stop();
         printStep(step.type, step.content, step.toolName);
         if (step.type !== 'output' && step.type !== 'error') {
@@ -150,9 +188,26 @@ async function executeAgent(agent: AgentConfig, userPrompt: string): Promise<voi
     // Print metrics
     printMetrics(result.metrics);
 
+    postLiveEvent({
+      traceId,
+      type: 'run_end',
+      status: 'completed',
+      finalOutput: result.finalOutput,
+      metrics: result.metrics,
+      simulated: result.simulated,
+    });
   } catch (err) {
     spinner.stop();
-    printError(err instanceof Error ? err.message : String(err));
+    const message = err instanceof Error ? err.message : String(err);
+    printError(message);
+    postLiveEvent({
+      traceId,
+      type: 'run_end',
+      status: 'failed',
+      finalOutput: message,
+      simulated: false,
+      error: message,
+    });
   }
 }
 

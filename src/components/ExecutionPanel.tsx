@@ -23,6 +23,7 @@ import {
 import { runAgentEngine } from '@/lib/agentEngine';
 import { fetchProviderBridge } from '@/lib/bridgeClient';
 import { fetchMcpBridge, fetchMcpTools } from '@/lib/mcpBridgeClient';
+import { newTraceId, postLiveEvent } from '@/lib/liveEventsClient';
 import { Markdown } from './Markdown';
 
 interface ExecutionPanelProps {
@@ -148,6 +149,18 @@ export const ExecutionPanel: React.FC<ExecutionPanelProps> = ({
     // el `setCurrentRun` funcional aún no ha llegado y perderíamos la traza.
     const streamedSteps: ThoughtStep[] = [];
 
+    const traceId = newTraceId();
+    postLiveEvent({
+      traceId,
+      type: 'run_start',
+      source: 'web',
+      targetKind: 'agent',
+      targetId: selectedAgent.id,
+      targetName: selectedAgent.name,
+      targetAvatar: selectedAgent.avatar,
+      prompt: userPrompt,
+    });
+
     try {
       const result = await runAgentEngine({
         agent: selectedAgent,
@@ -161,6 +174,7 @@ export const ExecutionPanel: React.FC<ExecutionPanelProps> = ({
         onStepUpdate: (step: ThoughtStep) => {
           streamedSteps.push(step);
           setCurrentRun((prev) => (prev ? { ...prev, steps: [...prev.steps, step] } : null));
+          postLiveEvent({ traceId, type: 'thought', step });
         },
       });
 
@@ -176,6 +190,14 @@ export const ExecutionPanel: React.FC<ExecutionPanelProps> = ({
 
       setCurrentRun(completedRun);
       onSaveRunHistory(completedRun);
+      postLiveEvent({
+        traceId,
+        type: 'run_end',
+        status: 'completed',
+        finalOutput: result.finalOutput,
+        metrics: result.metrics,
+        simulated: result.simulated,
+      });
 
       const assistantMessage: ConversationMessage = {
         role: 'assistant',
@@ -213,6 +235,14 @@ export const ExecutionPanel: React.FC<ExecutionPanelProps> = ({
       };
       setCurrentRun(failedRun);
       onSaveRunHistory(failedRun);
+      postLiveEvent({
+        traceId,
+        type: 'run_end',
+        status: 'failed',
+        finalOutput: failedRun.finalOutput,
+        simulated: false,
+        error: err instanceof Error ? err.message : String(err),
+      });
     } finally {
       setIsRunning(false);
     }

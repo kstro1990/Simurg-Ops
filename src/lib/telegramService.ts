@@ -7,7 +7,7 @@ import {
 } from '@/types/agent';
 import { resolveMemoryTurns, telegramThreadKey } from '@/types/conversation';
 import { runAgentEngine } from './agentEngine';
-import { runWorkflowPipeline, workflowStepToRun } from './workflowEngine';
+import { runWorkflowPipeline, workflowStepRunId, workflowStepToRun } from './workflowEngine';
 import { runProviderBridge } from './providerBridge';
 import { listMcpTools, runMcpBridge } from './mcpClient';
 import {
@@ -15,6 +15,7 @@ import {
   getConversationMessages,
   resetConversation,
 } from './serverStorage';
+import { newTraceId, publishLiveEvent } from './liveEvents';
 
 export interface TelegramBotInfo {
   id: number;
@@ -212,6 +213,21 @@ export async function processTelegramAgentRequest(options: {
 
   const history = await getConversationMessages(agent.id, threadKey);
 
+  // Monitor en vivo. Se emite después de los guardas de comando: `/ayuda` no
+  // produce ejecución, así que tampoco debe producir traza.
+  const traceId = newTraceId();
+  publishLiveEvent({
+    traceId,
+    type: 'run_start',
+    source: 'telegram',
+    targetKind: 'agent',
+    targetId: agent.id,
+    targetName: agent.name,
+    targetAvatar: agent.avatar,
+    prompt: userPrompt,
+    telegramChatId: String(chatId),
+  });
+
   try {
     const result = await runAgentEngine({
       agent,
@@ -223,6 +239,7 @@ export async function processTelegramAgentRequest(options: {
       bridgeFn: runProviderBridge,
       mcpFn: runMcpBridge,
       mcpListFn: listMcpTools,
+      onStepUpdate: (step) => publishLiveEvent({ traceId, type: 'thought', step }),
     });
 
     const simulatedWarning = result.simulated
@@ -250,6 +267,15 @@ export async function processTelegramAgentRequest(options: {
         // realimenta: el agente no debe construir sobre texto inventado.
         simulated: result.simulated,
       },
+    });
+
+    publishLiveEvent({
+      traceId,
+      type: 'run_end',
+      status: 'completed',
+      finalOutput: result.finalOutput,
+      metrics: result.metrics,
+      simulated: result.simulated,
     });
 
     return {
@@ -281,6 +307,15 @@ export async function processTelegramAgentRequest(options: {
       chatId,
       `❌ *${agent.name}* no pudo completar la solicitud:\n\n${message}`
     );
+
+    publishLiveEvent({
+      traceId,
+      type: 'run_end',
+      status: 'failed',
+      finalOutput: message,
+      simulated: false,
+      error: message,
+    });
 
     return {
       id: 'run-tg-' + Date.now(),
@@ -407,6 +442,23 @@ export async function processTelegramWorkflowRequest(options: {
     renderProgress(workflow, stepResults, agents)
   );
 
+  // Monitor en vivo: igual que en la ruta de agente, después de los guardas de
+  // comando y del workflow vacío.
+  const traceId = newTraceId();
+  const timestamp = new Date().toISOString();
+  publishLiveEvent({
+    traceId,
+    type: 'run_start',
+    source: 'telegram',
+    targetKind: 'workflow',
+    targetId: workflow.id,
+    targetName: workflow.name,
+    targetAvatar: '🔗',
+    prompt: userPrompt,
+    telegramChatId: String(chatId),
+    totalSteps: workflow.steps.length,
+  });
+
   const pipeline = await runWorkflowPipeline({
     workflow,
     agents,
@@ -417,8 +469,38 @@ export async function processTelegramWorkflowRequest(options: {
     bridgeFn: runProviderBridge,
     mcpFn: runMcpBridge,
     mcpListFn: listMcpTools,
-    onStepResult: async (result) => {
+    onStepStart: (index) => {
+      const step = workflow.steps[index];
+      const agent = agents[step.agentId];
+      publishLiveEvent({
+        traceId,
+        type: 'step_start',
+        index,
+        stepName: step.stepName,
+        agentName: agent?.name ?? step.agentId,
+        agentAvatar: agent?.avatar ?? '⚠️',
+      });
+    },
+    onAgentStep: (step, index) => publishLiveEvent({ traceId, type: 'thought', index, step }),
+    onStepResult: async (result, index) => {
       stepResults.push(result);
+      publishLiveEvent({
+        traceId,
+        type: 'step_result',
+        index,
+        stepName: result.stepName,
+        agentName: result.agentName,
+        agentAvatar: result.agentAvatar,
+        status: result.status,
+        output: result.output,
+        metrics: result.metrics ?? undefined,
+        simulated: result.simulated,
+        ...(result.error ? { error: result.error } : {}),
+        ...(result.status === 'skipped'
+          ? {}
+          : { runId: workflowStepRunId(timestamp, index) }),
+      });
+
       const text = renderProgress(workflow, stepResults, agents);
       // Se espera a propósito: sin await los edits llegarían desordenados.
       progressId = progressId
@@ -434,6 +516,14 @@ export async function processTelegramWorkflowRequest(options: {
       chatId,
       `❌ El pipeline *${workflow.name}* se detuvo en "${failure?.stepName ?? 'un paso'}":\n\n${failure?.error ?? 'Error desconocido.'}`
     );
+    publishLiveEvent({
+      traceId,
+      type: 'run_end',
+      status: 'failed',
+      finalOutput: pipeline.finalOutput,
+      simulated: pipeline.simulated,
+      error: failure?.error ?? 'Error desconocido.',
+    });
   } else {
     const last = pipeline.stepResults.filter((s) => s.status === 'completed').at(-1);
     const totalMs = pipeline.stepResults.reduce((sum, s) => sum + (s.metrics?.latencyMs ?? 0), 0);
@@ -451,10 +541,18 @@ export async function processTelegramWorkflowRequest(options: {
       `🤖 *${last?.agentAvatar ?? '🔗'} ${last?.agentName ?? workflow.name}*:\n\n${pipeline.finalOutput}\n\n` +
         `⏱️ _Total: ${(totalMs / 1000).toFixed(1)} s | Tokens: ${totalTokens}_${simulatedWarning}`
     );
+
+    publishLiveEvent({
+      traceId,
+      type: 'run_end',
+      status: pipeline.aborted ? 'aborted' : 'completed',
+      finalOutput: pipeline.finalOutput,
+      simulated: pipeline.simulated,
+    });
   }
 
-  // Un paso omitido no llegó a ejecutarse: no hay nada que registrar.
-  const timestamp = new Date().toISOString();
+  // Un paso omitido no llegó a ejecutarse: no hay nada que registrar. El
+  // `timestamp` es el mismo que ya usó el monitor para calcular los `runId`.
   return pipeline.stepResults
     .map((result, index) =>
       result.status === 'skipped'

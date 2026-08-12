@@ -188,3 +188,25 @@ The chain lives in **one** place — `runWorkflowPipeline()` in `src/lib/workflo
 `/api/workflows/execute` resolves agents from `getStoredAgents()` and accepts `workflowId` as an alternative to an inline `workflow`. `agentsMap` in the body is now an optional override for unsaved agents — requiring it meant a programmatic caller had to re-send full agent configs, MCP credentials included.
 
 `POST /api/workflows` validates through `isWorkflowConfig()` and **upserts by `id`**. Both matter: it used to persist any JSON, so `{}` became a workflow with no `id` that `DELETE ?id=` could never remove; and the blind prepend duplicated a workflow every time the UI's edit form saved it.
+
+### Monitor en vivo: efímero por diseño
+
+The "En vivo" tab (`LiveMonitor.tsx`) shows requests **while they run** — Telegram bots (agent and workflow), the workbench, `WorkflowBuilder`, `/api/*/execute`, and the CLI. It is a fifth tab, and `AppTab` (`src/types/ui.ts`) now holds the union that was duplicated between `page.tsx` and `NavbarProps`.
+
+It is **not** history. `data/history.json` is the audit log and survives restarts; the live bus is a `Map` in `src/lib/liveEvents.ts` that dies with the process. Nothing is written to `data/`. A trace is evicted the moment its `run_end` lands, plus a TTL sweep (10 min) for the traces whose `run_end` never comes — a hard restart mid-pipeline, an exception outside a `try`. Caps mirror the storage ones in spirit: `MAX_ACTIVE_TRACES` (20), `MAX_EVENTS_PER_TRACE` (200), every text field truncated to `LIVE_TEXT_CAP`.
+
+`publishLiveEvent()` **never throws** and wraps each subscriber in its own `try`. A wedged SSE connection must not be able to kill a Telegram bot — same degrade-never-abort rule as MCP, the opposite of `bridgeFn`.
+
+The bus is pinned on `globalThis` under a versioned `Symbol.for()` key. Turbopack re-evaluates server modules on hot reload; without the pin you get two buses, producers publishing into one and the stream listening on the other, and the monitor silently goes dead.
+
+**`liveEvents.ts` is server-only and must stay unreachable from the browser.** Do not publish from inside `agentEngine.ts` or `workflowEngine.ts` — they run in the browser too. The engines expose callbacks (`onStepStart`, `onStepResult`, the new `onAgentStep`) and the *caller* publishes; same reason `bridgeFn` and `mcpFn` are injected.
+
+- **`GET /api/events/stream`** — SSE. The `snapshot` frame is enqueued **synchronously in `start()`**: Next only flushes headers on the first write (`pipe-readable.js`), so a deferred first frame leaves `EventSource.onopen` hanging and an idle connection looks hung. `Cache-Control: no-cache, no-transform` is load-bearing — Next's `compression` middleware runs in dev *and* prod and `no-transform` is what makes it skip. Cleanup is idempotent because Next fires **both** `request.signal`'s abort and the stream's `cancel()`. No `export const dynamic`: Route Handlers are uncached by default since 15, and that flag is removed under Cache Components.
+- **`POST /api/events/publish`** — ingest for the producers outside the server process: the browser engines and the CLI. Takes a batch (a Gemini agentic loop would otherwise cost one request per thought). **Unauthenticated**, like everything else here — anyone who can reach the port can inject events, which is why the monitor renders event text as plain text and never through `Markdown`.
+- The CLI only emits when `HARNESS_EVENTS_URL` is set. Without it there is no connection attempt at all, so running the CLI with no server up costs nothing.
+
+The `EventSource` lives in a module-level ref-counted store (`liveEventsClient.ts`), not in `page.tsx`, and `LiveMonitorConnection` is a `null`-rendering component that just holds a reference. `page.tsx` owns all app state and renders every panel unmemoized, so putting a per-event `setState` there would repaint a mid-run `ExecutionPanel` dozens of times a second. Notifications are coalesced on a ~100 ms timer and `getSnapshot()` returns a cached reference — a fresh array per call is an infinite render loop.
+
+Client-side, a finished trace **stays on screen** even though the server dropped it; on reconnect the snapshot replaces the live traces and local finished ones are kept (`mergeSnapshot`). There is deliberately no `Last-Event-ID` replay: the data is ephemeral, so a gap is honest.
+
+Two shape details worth knowing: a `skipped` step emits `step_result` with **no** preceding `step_start` (the engine fires `onStepStart` after resolving the agent), so the UI reducer tolerates a missing start; and Anthropic's agentic tool calls run inside `providerBridge.ts` and surface as `toolTrace` afterwards, so those steps arrive in one burst at the end rather than in real time.

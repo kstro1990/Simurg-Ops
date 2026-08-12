@@ -7,7 +7,13 @@ import {
   getStoredSettings,
   getStoredWorkflows,
 } from '@/lib/serverStorage';
-import { indexAgents, runWorkflowPipeline, workflowStepToRun } from '@/lib/workflowEngine';
+import {
+  indexAgents,
+  runWorkflowPipeline,
+  workflowStepRunId,
+  workflowStepToRun,
+} from '@/lib/workflowEngine';
+import { newTraceId, publishLiveEvent } from '@/lib/liveEvents';
 import {
   AgentConfig,
   ProviderKeys,
@@ -62,8 +68,25 @@ export async function POST(req: NextRequest) {
     const agents = { ...indexAgents(await getStoredAgents()), ...(agentsMap || {}) };
     const storedKeys = await getStoredSettings();
 
+    // Se sella antes de arrancar para que el monitor en vivo pueda anunciar el
+    // `runId` de cada paso mientras la cadena todavía corre.
+    const timestamp = new Date().toISOString();
+    const traceId = newTraceId();
+    const wf = resolvedWorkflow;
+    publishLiveEvent({
+      traceId,
+      type: 'run_start',
+      source: 'web',
+      targetKind: 'workflow',
+      targetId: wf.id,
+      targetName: wf.name,
+      targetAvatar: '🔗',
+      prompt: initialPrompt,
+      totalSteps: wf.steps.length,
+    });
+
     const pipeline = await runWorkflowPipeline({
-      workflow: resolvedWorkflow,
+      workflow: wf,
       agents,
       initialPrompt,
       apiKey,
@@ -71,11 +94,49 @@ export async function POST(req: NextRequest) {
       bridgeFn: runProviderBridge,
       mcpFn: runMcpBridge,
       mcpListFn: listMcpTools,
+      onStepStart: (index) => {
+        const step = wf.steps[index];
+        const agent = agents[step.agentId];
+        publishLiveEvent({
+          traceId,
+          type: 'step_start',
+          index,
+          stepName: step.stepName,
+          agentName: agent?.name ?? step.agentId,
+          agentAvatar: agent?.avatar ?? '⚠️',
+        });
+      },
+      onAgentStep: (step, index) => publishLiveEvent({ traceId, type: 'thought', index, step }),
+      onStepResult: (result, index) =>
+        publishLiveEvent({
+          traceId,
+          type: 'step_result',
+          index,
+          stepName: result.stepName,
+          agentName: result.agentName,
+          agentAvatar: result.agentAvatar,
+          status: result.status,
+          output: result.output,
+          metrics: result.metrics ?? undefined,
+          simulated: result.simulated,
+          ...(result.error ? { error: result.error } : {}),
+          ...(result.status === 'skipped' ? {} : { runId: workflowStepRunId(timestamp, index) }),
+        }),
+    });
+
+    publishLiveEvent({
+      traceId,
+      type: 'run_end',
+      status: pipeline.failed ? 'failed' : 'completed',
+      finalOutput: pipeline.finalOutput,
+      simulated: pipeline.simulated,
+      ...(pipeline.failed
+        ? { error: pipeline.stepResults.at(-1)?.error ?? 'El pipeline falló.' }
+        : {}),
     });
 
     // El camino de navegador ya escribía historial por paso; este no. Se hace
     // secuencialmente porque `addHistoryRun` es read-modify-write bajo lock.
-    const timestamp = new Date().toISOString();
     for (const [index, step] of pipeline.stepResults.entries()) {
       if (step.status === 'skipped') continue;
       try {

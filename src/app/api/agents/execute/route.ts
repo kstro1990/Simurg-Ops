@@ -7,6 +7,7 @@ import {
   getConversationMessages,
   getStoredSettings,
 } from '@/lib/serverStorage';
+import { newTraceId, publishLiveEvent } from '@/lib/liveEvents';
 import { AgentConfig, ProviderKeys } from '@/types/agent';
 
 export async function POST(req: NextRequest) {
@@ -35,17 +36,54 @@ export async function POST(req: NextRequest) {
     const storedKeys = await getStoredSettings();
     const history = threadKey ? await getConversationMessages(agent.id, threadKey) : [];
 
-    const result = await runAgentEngine({
-      agent,
-      userPrompt: prompt,
-      history,
-      apiKey,
-      providerKeys: { ...storedKeys, ...(providerKeys || {}) },
-      // En el servidor se invoca el puente directamente: un fetch relativo no
-      // resolvería y la ejecución caería silenciosamente al simulador.
-      bridgeFn: runProviderBridge,
-      mcpFn: runMcpBridge,
-      mcpListFn: listMcpTools,
+    const traceId = newTraceId();
+    publishLiveEvent({
+      traceId,
+      type: 'run_start',
+      source: 'web',
+      targetKind: 'agent',
+      targetId: agent.id,
+      targetName: agent.name,
+      targetAvatar: agent.avatar,
+      prompt,
+    });
+
+    let result;
+    try {
+      result = await runAgentEngine({
+        agent,
+        userPrompt: prompt,
+        history,
+        apiKey,
+        providerKeys: { ...storedKeys, ...(providerKeys || {}) },
+        // En el servidor se invoca el puente directamente: un fetch relativo no
+        // resolvería y la ejecución caería silenciosamente al simulador.
+        bridgeFn: runProviderBridge,
+        mcpFn: runMcpBridge,
+        mcpListFn: listMcpTools,
+        onStepUpdate: (step) => publishLiveEvent({ traceId, type: 'thought', step }),
+      });
+    } catch (err) {
+      // Sin esto la traza se quedaría "en curso" hasta que la barriera el TTL.
+      const message = err instanceof Error ? err.message : String(err);
+      publishLiveEvent({
+        traceId,
+        type: 'run_end',
+        status: 'failed',
+        finalOutput: message,
+        simulated: false,
+        error: message,
+      });
+      throw err;
+    }
+
+    publishLiveEvent({
+      traceId,
+      type: 'run_end',
+      status: 'completed',
+      finalOutput: result.finalOutput,
+      metrics: result.metrics,
+      simulated: result.simulated,
     });
 
     if (threadKey) {

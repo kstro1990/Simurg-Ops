@@ -2,6 +2,7 @@ import {
   AgentConfig,
   ExecutionRun,
   ProviderKeys,
+  ThoughtStep,
   WorkflowConfig,
   WorkflowStepResult,
 } from '@/types/agent';
@@ -54,6 +55,12 @@ export interface RunWorkflowPipelineOptions {
    * y sin el await los edits llegarían desordenados.
    */
   onStepResult?: (result: WorkflowStepResult, index: number) => void | Promise<void>;
+  /**
+   * Traza de pensamiento del agente del paso `index`, según se produce. Sin
+   * esto el monitor en vivo enseñaría los workflows mucho más gruesos que los
+   * agentes sueltos, lo que se lee como un fallo.
+   */
+  onAgentStep?: (step: ThoughtStep, index: number) => void;
   /** Se comprueba en la frontera de cada paso; no aborta una llamada en vuelo. */
   signal?: AbortSignal;
 }
@@ -79,6 +86,15 @@ export interface WorkflowStepRunOptions {
 }
 
 /**
+ * Id de historial de un paso. Se expone para que el monitor en vivo pueda
+ * referenciar la `ExecutionRun` que acabará en `data/history.json` sin volver a
+ * escribir el formato a mano y arriesgarse a que las dos versiones deriven.
+ */
+export function workflowStepRunId(timestamp: string, index: number): string {
+  return `run-wf-${Date.parse(timestamp) || Date.now()}-${index}`;
+}
+
+/**
  * Convierte un paso ejecutado en la entrada de historial correspondiente, para
  * que el camino de navegador y el de servidor escriban exactamente el mismo
  * shape en `data/history.json`.
@@ -90,7 +106,7 @@ export function workflowStepToRun(
 ): ExecutionRun {
   const { timestamp = new Date().toISOString(), source = 'web', telegramChatId } = options;
   return {
-    id: `run-wf-${Date.parse(timestamp) || Date.now()}-${index}`,
+    id: workflowStepRunId(timestamp, index),
     agentId: result.agentId,
     agentName: result.agentName,
     agentAvatar: result.agentAvatar,
@@ -134,6 +150,7 @@ export async function runWorkflowPipeline(
     mcpListFn,
     onStepStart,
     onStepResult,
+    onAgentStep,
     signal,
   } = options;
 
@@ -194,6 +211,7 @@ export async function runWorkflowPipeline(
         bridgeFn,
         mcpFn,
         mcpListFn,
+        ...(onAgentStep ? { onStepUpdate: (step: ThoughtStep) => onAgentStep(step, index) } : {}),
       });
 
       simulated = simulated || result.simulated;

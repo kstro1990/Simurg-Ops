@@ -1,14 +1,29 @@
 'use client';
-import React from 'react';
-import { Bot, Key, Plus, History, Layers, Terminal } from 'lucide-react';
+import React, { useSyncExternalStore } from 'react';
+import { Bot, Key, Plus, History, Layers, Terminal, Radio } from 'lucide-react';
+import { liveStore } from '@/lib/liveEventsClient';
+import type { AppTab } from '@/types/ui';
 
 interface NavbarProps {
-  activeTab: 'agents' | 'workbench' | 'workflows' | 'history';
-  setActiveTab: (tab: 'agents' | 'workbench' | 'workflows' | 'history') => void;
+  activeTab: AppTab;
+  setActiveTab: (tab: AppTab) => void;
   onOpenApiKeyModal: () => void;
   onOpenNewAgentModal: () => void;
   hasApiKey: boolean;
   activeAgentCount: number;
+}
+
+/**
+ * Punto de actividad de la pestaña "En vivo". Se suscribe aquí, y no en
+ * `page.tsx`, para que el repintado quede acotado al Navbar: el contador es un
+ * número, así que React solo vuelve a renderizar cuando cambia de verdad.
+ */
+function useLiveRunningCount(): number {
+  return useSyncExternalStore(
+    liveStore.subscribe,
+    () => liveStore.getSnapshot().traces.filter((t) => t.status === 'running').length,
+    () => 0
+  );
 }
 
 export const Navbar: React.FC<NavbarProps> = ({
@@ -19,6 +34,8 @@ export const Navbar: React.FC<NavbarProps> = ({
   hasApiKey,
   activeAgentCount,
 }) => {
+  const liveRunningCount = useLiveRunningCount();
+
   return (
     <header className="sticky top-0 z-40 w-full glass-panel border-b border-white/10 px-4 lg:px-8 py-3">
       <div className="max-w-7xl mx-auto flex flex-col md:flex-row items-center justify-between gap-4">
@@ -76,6 +93,24 @@ export const Navbar: React.FC<NavbarProps> = ({
           >
             <Layers className="w-3.5 h-3.5" />
             Workflows
+          </button>
+
+          <button
+            onClick={() => setActiveTab('live')}
+            className={`relative flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs font-medium transition-all ${
+              activeTab === 'live'
+                ? 'bg-indigo-600 text-white shadow-md shadow-indigo-500/25'
+                : 'text-slate-400 hover:text-slate-200 hover:bg-white/5'
+            }`}
+          >
+            <Radio className="w-3.5 h-3.5" />
+            En vivo
+            {liveRunningCount > 0 && (
+              <span className="absolute -top-0.5 -right-0.5 flex h-2 w-2">
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75" />
+                <span className="relative inline-flex rounded-full h-2 w-2 bg-amber-400" />
+              </span>
+            )}
           </button>
 
           <button

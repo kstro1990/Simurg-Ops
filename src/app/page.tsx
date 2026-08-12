@@ -15,6 +15,8 @@ import { AgentModal } from '@/components/AgentModal';
 import { ExecutionPanel } from '@/components/ExecutionPanel';
 import { WorkflowBuilder } from '@/components/WorkflowBuilder';
 import { HistoryModal } from '@/components/HistoryModal';
+import { LiveMonitor, LiveMonitorConnection } from '@/components/LiveMonitor';
+import type { AppTab } from '@/types/ui';
 import { ApiKeyModal } from '@/components/ApiKeyModal';
 import {
   TelegramModal,
@@ -27,9 +29,7 @@ import { Search, Sparkles, Send } from 'lucide-react';
 const TELEGRAM_POLL_INTERVAL_MS = 3000;
 
 export default function Home() {
-  const [activeTab, setActiveTab] = useState<'agents' | 'workbench' | 'workflows' | 'history'>(
-    'agents'
-  );
+  const [activeTab, setActiveTab] = useState<AppTab>('agents');
   const [agents, setAgents] = useState<AgentConfig[]>(DEFAULT_AGENTS);
   const [workflows, setWorkflows] = useState<WorkflowConfig[]>(DEFAULT_WORKFLOWS);
   const [selectedAgent, setSelectedAgent] = useState<AgentConfig | null>(DEFAULT_AGENTS[0]);
@@ -398,6 +398,10 @@ export default function Home() {
 
   return (
     <div className="min-h-screen flex flex-col bg-[#090d16] text-slate-100 selection:bg-indigo-500 selection:text-white">
+      {/* Mantiene el stream SSE abierto en cualquier pestaña. No renderiza nada
+          ni provoca renders aquí: el estado vive fuera de React. */}
+      <LiveMonitorConnection />
+
       <Navbar
         activeTab={activeTab}
         setActiveTab={setActiveTab}
@@ -544,7 +548,10 @@ export default function Home() {
           />
         )}
 
-        {/* PESTAÑA 4: HISTORIAL */}
+        {/* PESTAÑA 4: EN VIVO */}
+        {activeTab === 'live' && <LiveMonitor />}
+
+        {/* PESTAÑA 5: HISTORIAL */}
         {activeTab === 'history' && (
           <HistoryModal runs={runsHistory} onClearHistory={handleClearHistory} />
         )}
