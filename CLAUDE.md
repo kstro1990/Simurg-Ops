@@ -76,7 +76,7 @@ Never treat a `simulated` run as model output.
 
 ### Persistence: `data/*.json`
 
-`src/lib/serverStorage.ts` owns all reads and writes. `data/` is **gitignored** — it holds bot tokens and API keys in plaintext.
+`src/lib/serverStorage.ts` owns all reads and writes. `data/` is **gitignored** — it holds bot tokens and API keys in plaintext. That now includes `workflows.json`, not just `agents.json` and `settings.json`: a workflow can carry its own `telegramConfig`.
 
 - Writes go to a `.tmp` file and are `rename`d into place (atomic on POSIX), serialized per-file through an in-module promise-chain mutex. Read-modify-write helpers (`addHistoryRun`, `saveOrUpdateAgent`, …) run inside that lock.
 - A corrupt JSON file is moved aside to `<file>.corrupt-<timestamp>` rather than overwritten with presets — the old behaviour silently destroyed the user's agents.
@@ -103,11 +103,24 @@ Threading per provider lives in `src/lib/conversationFormat.ts`. Gemini, Anthrop
 
 ### Telegram
 
-Each agent carries its own `telegramConfig` (one agent ↔ one bot). Enrolment requires a successful `/api/telegram/verify` call — the modal will not mark a bot `connected` on an unverified token.
+**Agents and workflows both enrol**, each carrying its own `telegramConfig` (one owner ↔ one bot) and sharing one generalized `TelegramModal` — see `TelegramTarget` and the `agentTelegramTarget()` / `workflowTelegramTarget()` adapters. Enrolment requires a successful `/api/telegram/verify` call — the modal will not mark a bot `connected` on an unverified token.
 
-- **Polling** — `page.tsx` pings `/api/telegram/poll` every 3s, but sends no payload: agents, keys, and offsets are all read server-side, so reloading the page no longer reprocesses old messages.
-- **Webhook** — `/api/telegram/webhook?agentId=<id>` loads the real stored agent and its token. It never accepts credentials via query string. Set `TELEGRAM_WEBHOOK_SECRET` to require Telegram's `X-Telegram-Bot-Api-Secret-Token` header.
+**A bot token may belong to exactly one owner.** `getUpdates` is exclusive per token: two pollers on the same bot steal each other's messages, and since each tracks its own offset, both advance independently and updates vanish non-deterministically. One-agent-one-bot made this implicit; workflows make it possible to duplicate a token, so `verify` now runs `findTelegramTokenOwner()` (`serverStorage.ts`) and answers **409** naming the current owner. The caller passes `ownerKind`/`ownerId` so re-verifying your own token isn't a conflict.
+
+- **Polling** — `page.tsx` pings `/api/telegram/poll` every 3s, but sends no payload: agents, workflows, keys, and offsets are all read server-side, so reloading the page no longer reprocesses old messages. The gate that starts the interval counts **both** kinds; when it only counted agents, a workflow-only install never polled at all.
+- **Offsets** — keyed by `telegramOffsetKey(kind, id)`: agents keep their bare id so existing offsets stay valid, workflows go under `wf:<id>`.
+- **Webhook** — `/api/telegram/webhook?agentId=<id>` or `?workflowId=<id>` loads the real stored owner and its token. It never accepts credentials via query string. Set `TELEGRAM_WEBHOOK_SECRET` to require Telegram's `X-Telegram-Bot-Api-Secret-Token` header.
 - **Conversation** — one thread per `chat.id`. `processTelegramAgentRequest` returns `ExecutionRun | null`, `null` meaning the message was a command (`/nuevo`, `/start`, `/ayuda`) so there is no run to record — every call site needs the `if (run)` guard. `parseTelegramCommand()` tolerates the `@bot` suffix Telegram appends in groups; matching `text === '/nuevo'` would treat it as a prompt.
+
+#### Workflow bots
+
+`processTelegramWorkflowRequest()` is the sibling of the agent one: one message runs the whole chain through `runWorkflowPipeline()`. It returns `ExecutionRun[]` — one per executed step — and the empty array is the analogue of the agent path's `null`, meaning the message was a command.
+
+- **No memory, by design.** A pipeline step is not a conversation turn, so nothing is read from or written to `data/conversations.json` and every message starts the chain from scratch. `/nuevo` says so rather than silently doing nothing.
+- **One live progress message.** The bot sends a status block and rewrites it with `editTelegramMessage()` as each step closes (✅ / ⏭️ / ❌), then sends the final output. That is why `onStepResult` is `void | Promise<void>` and the engine awaits it — fire-and-forget edits arrive out of order. `sendTelegramMessage()` returns the first chunk's `message_id` for this; a failed edit falls back to a new message.
+- **Runs are attributed to Telegram** via `workflowStepToRun(step, i, { source: 'telegram', telegramChatId })`. Skipped steps never executed, so they are not recorded.
+- **The poll tick handles at most one pipeline message per tick.** Ticks are sequential across every bot and a chain can take minutes; without the cap, a burst of messages would leave every other bot mute. The rest stay queued because their offset isn't advanced. `isPollingRef` in `page.tsx` already prevents overlapping ticks, so nothing is double-processed. A real fix needs a job queue.
+- **The workflow webhook answers 200 before running**, unlike the agent one. Telegram retries an update the webhook doesn't answer in time, which on a multi-minute chain means running the pipeline twice. The harness is a long-lived process, so the run is detached — history and chat delivery happen after the response.
 
 ### Tools: MCP is the only mechanism
 
@@ -162,4 +175,16 @@ Same bridge indirection as providers — `mcpFn` is injected, never imported fro
 
 ### Workflows
 
-`WorkflowConfig` is a linear chain: each step's `finalOutput` becomes the next step's prompt, prefixed by that step's optional `customInstruction`. `WorkflowBuilder` runs the chain client-side and writes each step to history; `/api/workflows/execute` implements the same pipeline server-side for programmatic callers. No branching, no parallelism.
+`WorkflowConfig` is a linear chain: each step's `finalOutput` becomes the next step's prompt, prefixed by that step's optional `customInstruction`. No branching, no parallelism.
+
+The chain lives in **one** place — `runWorkflowPipeline()` in `src/lib/workflowEngine.ts` — driven by `WorkflowBuilder` in the browser and by `/api/workflows/execute` on the server. It takes the same injected `bridgeFn`/`mcpFn`/`mcpListFn` as `runAgentEngine`, and for the same reason. There used to be two hand-written copies of the loop, and they had already drifted: different context prefixes (so the same workflow produced different prompts depending on where it ran), different missing-agent behaviour, and history written on only one of the two paths.
+
+- The prefix is the exported constant `WORKFLOW_CONTEXT_PREFIX`. Don't inline it again.
+- Steps carry **no `history`** — a pipeline step is not a conversation turn, so `memoryTurns` does not apply and nothing touches `data/conversations.json`. The chaining *is* the context.
+- Three per-step outcomes, all of them non-fatal to the run as a whole: `completed`; `skipped` when the step's `agentId` no longer exists (the chain continues with the previous output untouched, and nothing is written to history); `failed` when `runAgentEngine` throws (the chain stops, but `stepResults` still carries every step already paid for). The server route therefore answers **200** with partial results on a mid-chain failure — 500 is reserved for errors in the route itself.
+- Both paths write one `ExecutionRun` per executed step, built by the shared `workflowStepToRun()` so the two histories are byte-identical in shape.
+- `signal` is checked at step boundaries only; it does not abort a `runAgentEngine` call in flight. That's what the workbench's "Detener" button drives.
+
+`/api/workflows/execute` resolves agents from `getStoredAgents()` and accepts `workflowId` as an alternative to an inline `workflow`. `agentsMap` in the body is now an optional override for unsaved agents — requiring it meant a programmatic caller had to re-send full agent configs, MCP credentials included.
+
+`POST /api/workflows` validates through `isWorkflowConfig()` and **upserts by `id`**. Both matter: it used to persist any JSON, so `{}` became a workflow with no `id` that `DELETE ?id=` could never remove; and the blind prepend duplicated a workflow every time the UI's edit form saved it.

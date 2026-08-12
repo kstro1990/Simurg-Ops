@@ -1,6 +1,13 @@
-import { AgentConfig, ExecutionRun, ProviderKeys } from '@/types/agent';
+import {
+  AgentConfig,
+  ExecutionRun,
+  ProviderKeys,
+  WorkflowConfig,
+  WorkflowStepResult,
+} from '@/types/agent';
 import { resolveMemoryTurns, telegramThreadKey } from '@/types/conversation';
 import { runAgentEngine } from './agentEngine';
+import { runWorkflowPipeline, workflowStepToRun } from './workflowEngine';
 import { runProviderBridge } from './providerBridge';
 import { listMcpTools, runMcpBridge } from './mcpClient';
 import {
@@ -36,13 +43,20 @@ export async function verifyTelegramToken(botToken: string): Promise<TelegramBot
   return data.result as TelegramBotInfo;
 }
 
+/**
+ * Envía un mensaje, troceándolo si excede el límite de Telegram.
+ *
+ * Devuelve el `message_id` del **primer** trozo, que es lo que necesita
+ * `editTelegramMessage` para el mensaje de progreso de los pipelines. `null` si
+ * no se pudo enviar nada.
+ */
 export async function sendTelegramMessage(
   botToken: string,
   chatId: string | number,
   text: string
-): Promise<boolean> {
+): Promise<number | null> {
   const cleanToken = botToken.trim();
-  if (!cleanToken || !chatId) return false;
+  if (!cleanToken || !chatId) return null;
 
   // Truncate message if it exceeds Telegram's 4096 character limit per message
   const maxLen = 4000;
@@ -51,9 +65,12 @@ export async function sendTelegramMessage(
     chunks.push(text.substring(i, i + maxLen));
   }
 
+  let firstMessageId: number | null = null;
+
   for (const chunk of chunks) {
+    let data: { ok?: boolean; result?: { message_id?: number } } | null = null;
     try {
-      await fetch(`https://api.telegram.org/bot${cleanToken}/sendMessage`, {
+      const res = await fetch(`https://api.telegram.org/bot${cleanToken}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -62,21 +79,70 @@ export async function sendTelegramMessage(
           parse_mode: 'Markdown',
         }),
       });
+      data = await res.json();
+      // Telegram responde 400 con ok:false cuando el Markdown del modelo tiene
+      // caracteres que no sabe cerrar; eso no lanza, hay que mirar el `ok`.
+      if (!data?.ok) throw new Error('markdown rechazado');
     } catch {
       // Reintento sin parse_mode: el Markdown del modelo puede tener
       // caracteres que Telegram rechaza.
-      await fetch(`https://api.telegram.org/bot${cleanToken}/sendMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: chatId,
-          text: chunk,
-        }),
-      });
+      try {
+        const res = await fetch(`https://api.telegram.org/bot${cleanToken}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: chatId,
+            text: chunk,
+          }),
+        });
+        data = await res.json();
+      } catch {
+        data = null;
+      }
+    }
+
+    if (firstMessageId === null && data?.ok && typeof data.result?.message_id === 'number') {
+      firstMessageId = data.result.message_id;
     }
   }
 
-  return true;
+  return firstMessageId;
+}
+
+/**
+ * Reescribe un mensaje ya enviado. Es lo que permite que el progreso de un
+ * pipeline sea un único mensaje que se actualiza, en vez de N+2 mensajes.
+ *
+ * Si el edit falla (mensaje demasiado viejo, Markdown inválido, texto idéntico)
+ * cae a enviar uno nuevo y devuelve su id: el usuario nunca se queda sin señal.
+ */
+export async function editTelegramMessage(
+  botToken: string,
+  chatId: string | number,
+  messageId: number,
+  text: string
+): Promise<number | null> {
+  const cleanToken = botToken.trim();
+  if (!cleanToken || !chatId) return null;
+
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${cleanToken}/editMessageText`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        message_id: messageId,
+        text: text.slice(0, 4000),
+        parse_mode: 'Markdown',
+      }),
+    });
+    const data = await res.json();
+    if (data?.ok) return messageId;
+  } catch {
+    // Cae al envío nuevo.
+  }
+
+  return sendTelegramMessage(botToken, chatId, text);
 }
 
 export type TelegramCommand = 'nuevo' | 'start' | 'ayuda';
@@ -232,6 +298,174 @@ export async function processTelegramAgentRequest(options: {
       threadKey,
     };
   }
+}
+
+// --- WORKFLOWS ---
+
+const STEP_ICON: Record<WorkflowStepResult['status'], string> = {
+  completed: '✅',
+  skipped: '⏭️',
+  failed: '❌',
+};
+
+function formatSeconds(ms?: number): string {
+  return typeof ms === 'number' ? ` (${(ms / 1000).toFixed(1)} s)` : '';
+}
+
+/**
+ * Cuerpo del mensaje de progreso. Se recalcula entero en cada paso y se reenvía
+ * con `editTelegramMessage`, de modo que el chat conserva un único mensaje vivo
+ * en lugar de acumular uno por paso.
+ */
+function renderProgress(
+  workflow: WorkflowConfig,
+  results: WorkflowStepResult[],
+  agents: Record<string, AgentConfig>
+): string {
+  const lines = workflow.steps.map((step, index) => {
+    const done = results[index];
+    const agent = agents[step.agentId];
+    const label = `${agent?.avatar ?? '⚠️'} ${agent?.name ?? step.agentId}`;
+
+    if (done) {
+      return `${STEP_ICON[done.status]} ${index + 1}/${workflow.steps.length} · ${label}${formatSeconds(done.metrics?.latencyMs ?? undefined)}`;
+    }
+    // El primer paso sin resultado es el que está corriendo ahora mismo.
+    const running = index === results.length;
+    return `${running ? '⏳' : '◽'} ${index + 1}/${workflow.steps.length} · ${label}`;
+  });
+
+  return `🔗 *${workflow.name}* (${workflow.steps.length} pasos)\n\n${lines.join('\n')}`;
+}
+
+/**
+ * Atiende un mensaje entrante dirigido al bot de un **workflow**: un mensaje
+ * dispara la cadena completa.
+ *
+ * A diferencia de un agente, aquí **no hay memoria**. Un paso de pipeline no es
+ * un turno de conversación, así que nada se lee ni se escribe en
+ * `data/conversations.json` y cada mensaje arranca la cadena desde cero.
+ *
+ * Devuelve una ejecución por paso ejecutado — el análogo del `null` de
+ * `processTelegramAgentRequest` es aquí el array vacío, que significa que el
+ * mensaje era un comando y no hubo nada que registrar.
+ */
+export async function processTelegramWorkflowRequest(options: {
+  workflow: WorkflowConfig;
+  /** Agentes ya indexados por id. Ver `indexAgents()` en workflowEngine. */
+  agents: Record<string, AgentConfig>;
+  userPrompt: string;
+  chatId: string | number;
+  apiKey?: string;
+  providerKeys?: ProviderKeys;
+  botToken: string;
+}): Promise<ExecutionRun[]> {
+  const { workflow, agents, userPrompt, chatId, apiKey, providerKeys, botToken } = options;
+
+  const command = parseTelegramCommand(userPrompt);
+
+  if (command === 'nuevo') {
+    await sendTelegramMessage(
+      botToken,
+      chatId,
+      'ℹ️ Este bot ejecuta un pipeline y no guarda memoria: cada mensaje lanza la cadena completa desde cero, así que no hay nada que reiniciar.'
+    );
+    return [];
+  }
+
+  if (command === 'start' || command === 'ayuda') {
+    const steps = workflow.steps
+      .map((step, index) => {
+        const agent = agents[step.agentId];
+        return agent
+          ? `${index + 1}. ${agent.avatar} *${agent.name}* — \`${agent.model}\``
+          : `${index + 1}. ⚠️ Agente ${step.agentId} (no encontrado, se omitirá)`;
+      })
+      .join('\n');
+
+    await sendTelegramMessage(
+      botToken,
+      chatId,
+      `🔗 *${workflow.name}*\n${workflow.description}\n\n` +
+        `Cadena de ${workflow.steps.length} pasos:\n${steps}\n\n` +
+        'Escríbeme lo que quieras y lo recorreré entero, pasando la salida de cada agente al siguiente.\n\n' +
+        '⚠️ Este bot *no tiene memoria*: cada mensaje ejecuta la cadena desde cero.\n\n' +
+        'Comandos:\n/ayuda — mostrar esta ayuda'
+    );
+    return [];
+  }
+
+  if (workflow.steps.length === 0) {
+    await sendTelegramMessage(botToken, chatId, `⚠️ El workflow *${workflow.name}* no tiene pasos.`);
+    return [];
+  }
+
+  const stepResults: WorkflowStepResult[] = [];
+  let progressId = await sendTelegramMessage(
+    botToken,
+    chatId,
+    renderProgress(workflow, stepResults, agents)
+  );
+
+  const pipeline = await runWorkflowPipeline({
+    workflow,
+    agents,
+    initialPrompt: userPrompt,
+    apiKey,
+    providerKeys,
+    // Esto corre en el servidor: hay que invocar los puentes directamente.
+    bridgeFn: runProviderBridge,
+    mcpFn: runMcpBridge,
+    mcpListFn: listMcpTools,
+    onStepResult: async (result) => {
+      stepResults.push(result);
+      const text = renderProgress(workflow, stepResults, agents);
+      // Se espera a propósito: sin await los edits llegarían desordenados.
+      progressId = progressId
+        ? await editTelegramMessage(botToken, chatId, progressId, text)
+        : await sendTelegramMessage(botToken, chatId, text);
+    },
+  });
+
+  if (pipeline.failed) {
+    const failure = pipeline.stepResults.at(-1);
+    await sendTelegramMessage(
+      botToken,
+      chatId,
+      `❌ El pipeline *${workflow.name}* se detuvo en "${failure?.stepName ?? 'un paso'}":\n\n${failure?.error ?? 'Error desconocido.'}`
+    );
+  } else {
+    const last = pipeline.stepResults.filter((s) => s.status === 'completed').at(-1);
+    const totalMs = pipeline.stepResults.reduce((sum, s) => sum + (s.metrics?.latencyMs ?? 0), 0);
+    const totalTokens = pipeline.stepResults.reduce(
+      (sum, s) => sum + (s.metrics?.totalTokens ?? 0),
+      0
+    );
+    const simulatedWarning = pipeline.simulated
+      ? '\n\n⚠️ _Algún paso devolvió una respuesta SIMULADA: no se pudo contactar con el proveedor._'
+      : '';
+
+    await sendTelegramMessage(
+      botToken,
+      chatId,
+      `🤖 *${last?.agentAvatar ?? '🔗'} ${last?.agentName ?? workflow.name}*:\n\n${pipeline.finalOutput}\n\n` +
+        `⏱️ _Total: ${(totalMs / 1000).toFixed(1)} s | Tokens: ${totalTokens}_${simulatedWarning}`
+    );
+  }
+
+  // Un paso omitido no llegó a ejecutarse: no hay nada que registrar.
+  const timestamp = new Date().toISOString();
+  return pipeline.stepResults
+    .map((result, index) =>
+      result.status === 'skipped'
+        ? null
+        : workflowStepToRun(result, index, {
+            timestamp,
+            source: 'telegram',
+            telegramChatId: String(chatId),
+          })
+    )
+    .filter((run): run is ExecutionRun => run !== null);
 }
 
 export interface TelegramUpdate {

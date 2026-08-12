@@ -1,13 +1,22 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { processTelegramAgentRequest } from '@/lib/telegramService';
-import { addHistoryRun, getStoredAgents, getStoredSettings } from '@/lib/serverStorage';
+import {
+  processTelegramAgentRequest,
+  processTelegramWorkflowRequest,
+} from '@/lib/telegramService';
+import {
+  addHistoryRun,
+  getStoredAgents,
+  getStoredSettings,
+  getStoredWorkflows,
+} from '@/lib/serverStorage';
+import { indexAgents } from '@/lib/workflowEngine';
 
 /**
  * Recibe updates de Telegram por webhook.
  *
- * Configúralo con `?agentId=<id>` — el token y las claves se leen del estado
- * del servidor, nunca de la query string (una API key en la URL acaba en logs
- * de acceso, proxies y referers).
+ * Configúralo con `?agentId=<id>` o `?workflowId=<id>` — el token y las claves
+ * se leen del estado del servidor, nunca de la query string (una API key en la
+ * URL acaba en logs de acceso, proxies y referers).
  *
  * Si defines TELEGRAM_WEBHOOK_SECRET, se exige la cabecera
  * `X-Telegram-Bot-Api-Secret-Token` que Telegram envía cuando registras el
@@ -30,10 +39,55 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: true, status: 'Mensaje sin texto, ignorado.' });
     }
 
-    const agentId = new URL(req.url).searchParams.get('agentId');
+    const params = new URL(req.url).searchParams;
+    const agentId = params.get('agentId');
+    const workflowId = params.get('workflowId');
+
+    if (workflowId) {
+      const workflows = await getStoredWorkflows();
+      const workflow = workflows.find((w) => w.id === workflowId);
+
+      if (!workflow) {
+        return NextResponse.json({ error: `Workflow ${workflowId} no encontrado.` }, { status: 404 });
+      }
+
+      const botToken = workflow.telegramConfig?.botToken;
+      if (!workflow.telegramConfig?.enabled || !botToken) {
+        return NextResponse.json(
+          { error: `El workflow ${workflow.name} no está enrolado en Telegram.` },
+          { status: 409 }
+        );
+      }
+
+      const [agents, settings] = await Promise.all([getStoredAgents(), getStoredSettings()]);
+
+      // Se responde YA y el pipeline sigue por detrás. Una cadena de varios
+      // pasos tarda minutos; si el webhook no contesta a tiempo Telegram
+      // reintenta el update y el pipeline se ejecutaría dos veces. El harness
+      // es un proceso largo (`next start`), así que desacoplar es viable: la
+      // entrega al chat y el historial ocurren después de esta respuesta.
+      void processTelegramWorkflowRequest({
+        workflow,
+        agents: indexAgents(agents),
+        userPrompt: message.text,
+        chatId: message.chat.id,
+        apiKey: settings.geminiApiKey,
+        providerKeys: settings,
+        botToken,
+      })
+        .then(async (runs) => {
+          for (const run of runs) await addHistoryRun(run);
+        })
+        .catch((err) => {
+          console.error(`Error ejecutando el workflow ${workflow.name} desde el webhook:`, err);
+        });
+
+      return NextResponse.json({ ok: true, accepted: true, workflowId });
+    }
+
     if (!agentId) {
       return NextResponse.json(
-        { error: 'El webhook requiere el query param agentId.' },
+        { error: 'El webhook requiere el query param agentId o workflowId.' },
         { status: 400 }
       );
     }

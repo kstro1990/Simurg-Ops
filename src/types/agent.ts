@@ -195,20 +195,47 @@ export interface WorkflowConfig {
   name: string;
   description: string;
   steps: WorkflowStep[];
+  /**
+   * Bot propio del workflow, misma relación uno-a-uno que en `AgentConfig` y
+   * el mismo tipo. Un mensaje al bot ejecuta la cadena entera; no hay memoria,
+   * porque un paso de pipeline no es un turno de conversación.
+   */
+  telegramConfig?: TelegramConfig;
   createdAt: string;
 }
 
+export interface WorkflowStepResult {
+  stepId: string;
+  stepName: string;
+  agentId: string;
+  agentName: string;
+  agentAvatar: string;
+  agentRole: string;
+  /** Prompt real que recibió el agente, ya con el prefijo de contexto. */
+  input: string;
+  output: string;
+  steps: ThoughtStep[];
+  metrics: ExecutionMetrics | null;
+  simulated: boolean;
+  /**
+   * - `completed`: el agente respondió.
+   * - `skipped`: el `agentId` del paso ya no existe. La cadena continúa con la
+   *   salida del paso anterior sin modificar.
+   * - `failed`: `runAgentEngine` lanzó. La cadena se detiene aquí, pero los
+   *   pasos ya ejecutados se conservan.
+   */
+  status: 'completed' | 'skipped' | 'failed';
+  error?: string;
+}
+
+/** Respuesta de `/api/workflows/execute`. */
 export interface WorkflowRunResult {
   id: string;
   workflowId: string;
   workflowName: string;
-  status: 'pending' | 'running' | 'completed' | 'failed';
-  stepResults: {
-    stepId: string;
-    agentName: string;
-    input: string;
-    output: string;
-    status: 'completed' | 'failed';
-  }[];
+  status: 'completed' | 'failed';
+  stepResults: WorkflowStepResult[];
+  finalOutput: string;
+  simulated: boolean;
   timestamp: string;
 }

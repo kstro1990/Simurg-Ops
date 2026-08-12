@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState } from 'react';
-import { AgentConfig, ProviderKeys, TelegramConfig } from '@/types/agent';
+import { AgentConfig, ProviderKeys, TelegramConfig, WorkflowConfig } from '@/types/agent';
 import {
   Send,
   X,
@@ -13,27 +13,69 @@ import {
   AlertCircle,
 } from 'lucide-react';
 
+/**
+ * Un agente o un workflow, vistos desde el enrolamiento en Telegram. Ambos
+ * llevan un `telegramConfig` con la misma relación uno-a-uno con su bot, así
+ * que el modal es el mismo y solo cambian las etiquetas y el cuerpo que manda
+ * a `/api/telegram/test`.
+ */
+export interface TelegramTarget {
+  kind: 'agent' | 'workflow';
+  id: string;
+  name: string;
+  avatar: string;
+  /** `agent.role` para agentes; "N pasos secuenciales" para workflows. */
+  subtitle: string;
+  telegramConfig?: TelegramConfig;
+  /** Solo en agentes: el modal lo manda inline a la ruta de prueba. */
+  agent?: AgentConfig;
+}
+
+export function agentTelegramTarget(agent: AgentConfig): TelegramTarget {
+  return {
+    kind: 'agent',
+    id: agent.id,
+    name: agent.name,
+    avatar: agent.avatar,
+    subtitle: agent.role,
+    telegramConfig: agent.telegramConfig,
+    agent,
+  };
+}
+
+export function workflowTelegramTarget(workflow: WorkflowConfig): TelegramTarget {
+  return {
+    kind: 'workflow',
+    id: workflow.id,
+    name: workflow.name,
+    avatar: '🔗',
+    subtitle: `${workflow.steps.length} pasos secuenciales`,
+    telegramConfig: workflow.telegramConfig,
+  };
+}
+
 interface TelegramModalProps {
   onClose: () => void;
-  agent: AgentConfig;
+  target: TelegramTarget;
   apiKey?: string;
   providerKeys?: ProviderKeys;
-  onSaveTelegramConfig: (agentId: string, config: TelegramConfig) => void;
+  onSaveTelegramConfig: (targetId: string, config: TelegramConfig) => void;
 }
 
 export const TelegramModal: React.FC<TelegramModalProps> = ({
   onClose,
-  agent,
+  target,
   apiKey,
   providerKeys,
   onSaveTelegramConfig,
 }) => {
-  const [botToken, setBotToken] = useState(agent.telegramConfig?.botToken ?? '');
+  const isWorkflow = target.kind === 'workflow';
+  const [botToken, setBotToken] = useState(target.telegramConfig?.botToken ?? '');
   const [botInfo, setBotInfo] = useState<{ username: string; firstName: string } | null>(
-    agent.telegramConfig?.botUsername
+    target.telegramConfig?.botUsername
       ? {
-          username: agent.telegramConfig.botUsername,
-          firstName: agent.telegramConfig.botFirstName || agent.name,
+          username: target.telegramConfig.botUsername,
+          firstName: target.telegramConfig.botFirstName || target.name,
         }
       : null
   );
@@ -42,7 +84,11 @@ export const TelegramModal: React.FC<TelegramModalProps> = ({
   const [successMsg, setSuccessMsg] = useState('');
 
   const [testChatId, setTestChatId] = useState('');
-  const [testPrompt, setTestPrompt] = useState('Hola agente, ¿cuál es tu rol y capacidades?');
+  const [testPrompt, setTestPrompt] = useState(
+    isWorkflow
+      ? 'Prueba rápida: resume en dos frases para qué sirve esta cadena.'
+      : 'Hola agente, ¿cuál es tu rol y capacidades?'
+  );
   const [isSendingTest, setIsSendingTest] = useState(false);
 
   type BotInfo = { username: string; firstName: string };
@@ -61,7 +107,13 @@ export const TelegramModal: React.FC<TelegramModalProps> = ({
       const res = await fetch('/api/telegram/verify', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ botToken: botToken.trim() }),
+        // ownerKind/ownerId permiten que el dueño actual se re-verifique sin
+        // chocar consigo mismo; para cualquier otro el servidor responde 409.
+        body: JSON.stringify({
+          botToken: botToken.trim(),
+          ownerKind: target.kind,
+          ownerId: target.id,
+        }),
       });
 
       const data = await res.json();
@@ -99,7 +151,9 @@ export const TelegramModal: React.FC<TelegramModalProps> = ({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          agent,
+          // El workflow se resuelve en el servidor por id; el agente va inline
+          // para poder probar cambios aún sin guardar.
+          ...(isWorkflow ? { workflowId: target.id } : { agent: target.agent }),
           prompt: testPrompt,
           chatId: testChatId.trim(),
           botToken: botToken.trim(),
@@ -128,7 +182,7 @@ export const TelegramModal: React.FC<TelegramModalProps> = ({
   };
 
   const handleUnenroll = () => {
-    onSaveTelegramConfig(agent.id, { enabled: false, status: 'disconnected' });
+    onSaveTelegramConfig(target.id, { enabled: false, status: 'disconnected' });
     onClose();
   };
 
@@ -144,11 +198,11 @@ export const TelegramModal: React.FC<TelegramModalProps> = ({
     const info = botInfo ?? (await handleVerifyToken());
     if (!info) return;
 
-    onSaveTelegramConfig(agent.id, {
+    onSaveTelegramConfig(target.id, {
       enabled: true,
       botToken: botToken.trim(),
       botUsername: info.username,
-      botFirstName: info.firstName || agent.name,
+      botFirstName: info.firstName || target.name,
       status: 'connected',
       lastActive: new Date().toISOString(),
     });
@@ -165,11 +219,15 @@ export const TelegramModal: React.FC<TelegramModalProps> = ({
             </div>
             <div>
               <h2 className="text-base font-bold text-slate-100 flex items-center gap-2">
-                Enrolar Agente en Telegram
-                <span className="text-xs text-indigo-400 font-normal">({agent.name})</span>
+                {isWorkflow ? 'Enrolar Workflow en Telegram' : 'Enrolar Agente en Telegram'}
+                <span className="text-xs text-indigo-400 font-normal">
+                  ({target.avatar} {target.name})
+                </span>
               </h2>
               <p className="text-xs text-slate-400">
-                Conecta un Bot de Telegram autónomo a este agente
+                {isWorkflow
+                  ? `Cada mensaje ejecutará la cadena completa · ${target.subtitle}`
+                  : 'Conecta un Bot de Telegram autónomo a este agente'}
               </p>
             </div>
           </div>
@@ -321,7 +379,7 @@ export const TelegramModal: React.FC<TelegramModalProps> = ({
         </div>
 
         <div className="flex justify-between gap-2 px-6 py-4 border-t border-white/10 bg-slate-950/40">
-          {agent.telegramConfig?.enabled ? (
+          {target.telegramConfig?.enabled ? (
             <button
               onClick={handleUnenroll}
               className="px-4 py-2 rounded-xl text-xs font-semibold text-rose-400 hover:text-rose-300 bg-slate-900 border border-rose-500/30"

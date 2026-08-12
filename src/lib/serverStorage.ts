@@ -334,24 +334,75 @@ export async function deleteAgentConversations(agentId: string): Promise<void> {
   });
 }
 
+// --- TELEGRAM ---
+
+/** Qué clase de entidad tiene el bot: un agente o un workflow. */
+export type TelegramOwnerKind = 'agent' | 'workflow';
+
+export interface TelegramTokenOwner {
+  kind: TelegramOwnerKind;
+  id: string;
+  name: string;
+}
+
+/**
+ * Localiza a quién pertenece ya un bot token, entre agentes y workflows.
+ *
+ * `getUpdates` es **exclusivo por token**: dos sondeadores sobre el mismo bot se
+ * roban los mensajes entre sí y, como cada uno lleva su propio offset, ambos
+ * avanzan por separado y los updates se pierden de forma no determinista. La
+ * relación un-agente-un-bot lo evitaba de forma implícita; admitir workflows
+ * abre la puerta a duplicar el token, así que hace falta comprobarlo.
+ */
+export async function findTelegramTokenOwner(
+  botToken: string,
+  exclude?: { kind: TelegramOwnerKind; id: string }
+): Promise<TelegramTokenOwner | null> {
+  const token = botToken.trim();
+  if (!token) return null;
+
+  const [agents, workflows] = await Promise.all([getStoredAgents(), getStoredWorkflows()]);
+
+  const candidates: TelegramTokenOwner[] = [
+    ...agents
+      .filter((a) => a.telegramConfig?.botToken?.trim() === token)
+      .map((a) => ({ kind: 'agent' as const, id: a.id, name: a.name })),
+    ...workflows
+      .filter((w) => w.telegramConfig?.botToken?.trim() === token)
+      .map((w) => ({ kind: 'workflow' as const, id: w.id, name: w.name })),
+  ];
+
+  return (
+    candidates.find((c) => !(exclude && c.kind === exclude.kind && c.id === exclude.id)) ?? null
+  );
+}
+
 // --- OFFSETS DE TELEGRAM ---
 // Deben vivir en disco: si se guardan en el estado de React se reinician al
 // recargar la página y el bot reprocesa mensajes ya atendidos.
 export type TelegramOffsets = Record<string, number>;
+
+/**
+ * Clave del offset. Los agentes conservan su id desnudo para no invalidar los
+ * offsets ya guardados; los workflows van en su propio namespace `wf:`.
+ */
+export function telegramOffsetKey(kind: TelegramOwnerKind, id: string): string {
+  return kind === 'workflow' ? `wf:${id}` : id;
+}
 
 export async function getTelegramOffsets(): Promise<TelegramOffsets> {
   const { value } = await readJson<TelegramOffsets>(TELEGRAM_OFFSETS_FILE);
   return value && typeof value === 'object' ? value : {};
 }
 
-/** Fusiona offsets quedándose siempre con el mayor visto por agente. */
+/** Fusiona offsets quedándose siempre con el mayor visto por clave. */
 export async function mergeTelegramOffsets(offsets: TelegramOffsets): Promise<TelegramOffsets> {
   return withLock(TELEGRAM_OFFSETS_FILE, async () => {
     const { value } = await readJson<TelegramOffsets>(TELEGRAM_OFFSETS_FILE);
     const current = value && typeof value === 'object' ? value : {};
     const updated: TelegramOffsets = { ...current };
-    for (const [agentId, offset] of Object.entries(offsets)) {
-      updated[agentId] = Math.max(updated[agentId] ?? 0, offset);
+    for (const [key, offset] of Object.entries(offsets)) {
+      updated[key] = Math.max(updated[key] ?? 0, offset);
     }
     await writeJsonAtomic(TELEGRAM_OFFSETS_FILE, updated);
     return updated;

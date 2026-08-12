@@ -1,19 +1,31 @@
 'use client';
 
-import React, { useMemo, useState } from 'react';
-import { AgentConfig, ExecutionRun, WorkflowConfig, ProviderKeys } from '@/types/agent';
+import React, { useMemo, useRef, useState } from 'react';
+import {
+  AgentConfig,
+  ExecutionRun,
+  WorkflowConfig,
+  WorkflowStepResult,
+  ProviderKeys,
+} from '@/types/agent';
 import {
   Layers,
   ArrowRight,
   Play,
+  Square,
   CheckCircle2,
   Clock,
   Plus,
   Trash2,
+  Pencil,
+  ChevronUp,
+  ChevronDown,
   AlertCircle,
+  SkipForward,
   FlaskConical,
+  Send,
 } from 'lucide-react';
-import { runAgentEngine } from '@/lib/agentEngine';
+import { indexAgents, runWorkflowPipeline, workflowStepToRun } from '@/lib/workflowEngine';
 import { fetchProviderBridge } from '@/lib/bridgeClient';
 import { fetchMcpBridge, fetchMcpTools } from '@/lib/mcpBridgeClient';
 import { Markdown } from './Markdown';
@@ -26,16 +38,25 @@ interface WorkflowBuilderProps {
   onSaveWorkflow: (workflow: WorkflowConfig) => void;
   onDeleteWorkflow: (workflowId: string) => void;
   onSaveRunHistory: (run: ExecutionRun) => void;
+  /** Abre el modal de Telegram sobre este workflow. Lo posee `page.tsx`. */
+  onOpenTelegram: (workflow: WorkflowConfig) => void;
 }
 
-interface PipelineResult {
-  stepId: string;
+interface DraftStep {
+  agentId: string;
+  instruction: string;
+  /**
+   * Etiqueta del paso SIN el prefijo numérico, que se recalcula al guardar.
+   * Se arrastra por el formulario en vez de regenerarse desde el nombre del
+   * agente: es una etiqueta propia del paso ("Investigación Inicial"), y
+   * rehacerla borraba los nombres descriptivos al editar el workflow.
+   */
   stepName: string;
-  agentName: string;
-  agentAvatar: string;
-  output: string;
-  simulated: boolean;
-  failed: boolean;
+}
+
+/** Quita el "3. " inicial para que renumerar al guardar no lo acumule. */
+function stripStepNumber(stepName: string): string {
+  return stepName.replace(/^\s*\d+\.\s*/, '').trim();
 }
 
 export const WorkflowBuilder: React.FC<WorkflowBuilderProps> = ({
@@ -46,28 +67,27 @@ export const WorkflowBuilder: React.FC<WorkflowBuilderProps> = ({
   onSaveWorkflow,
   onDeleteWorkflow,
   onSaveRunHistory,
+  onOpenTelegram,
 }) => {
   const [selectedWorkflowId, setSelectedWorkflowId] = useState<string | null>(
     workflows[0]?.id ?? null
   );
-  const [initialPrompt, setInitialPrompt] = useState(
-    'Construye una solución completa para una app de gestión de proyectos con IA'
-  );
+  const [initialPrompt, setInitialPrompt] = useState('');
   const [isRunning, setIsRunning] = useState(false);
   const [activeStepIndex, setActiveStepIndex] = useState<number | null>(null);
-  const [pipelineResults, setPipelineResults] = useState<PipelineResult[]>([]);
+  const [pipelineResults, setPipelineResults] = useState<WorkflowStepResult[]>([]);
   const [runError, setRunError] = useState<string | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
 
-  // Estado del formulario de creación
-  const [isCreating, setIsCreating] = useState(false);
-  const [newWorkflowName, setNewWorkflowName] = useState('');
-  const [newWorkflowDesc, setNewWorkflowDesc] = useState('');
-  const [newSteps, setNewSteps] = useState<{ agentId: string; instruction: string }[]>([]);
+  // Estado del formulario, compartido entre alta y edición.
+  const [isFormOpen, setIsFormOpen] = useState(false);
+  const [editingWorkflowId, setEditingWorkflowId] = useState<string | null>(null);
+  const [editingCreatedAt, setEditingCreatedAt] = useState<string | null>(null);
+  const [draftName, setDraftName] = useState('');
+  const [draftDesc, setDraftDesc] = useState('');
+  const [draftSteps, setDraftSteps] = useState<DraftStep[]>([]);
 
-  const agentsMap = useMemo(
-    () => Object.fromEntries(agents.map((a) => [a.id, a])) as Record<string, AgentConfig>,
-    [agents]
-  );
+  const agentsMap = useMemo(() => indexAgents(agents), [agents]);
 
   // Los workflows llegan de forma asíncrona desde /api/workflows, así que la
   // selección se deriva en cada render en lugar de fijarse al montar: si se
@@ -80,131 +100,149 @@ export const WorkflowBuilder: React.FC<WorkflowBuilderProps> = ({
   const handleRunWorkflow = async () => {
     if (!selectedWorkflow || isRunning || !initialPrompt.trim()) return;
 
+    const controller = new AbortController();
+    abortRef.current = controller;
     setIsRunning(true);
     setPipelineResults([]);
     setRunError(null);
-    let currentInput = initialPrompt.trim();
 
     try {
-      for (let i = 0; i < selectedWorkflow.steps.length; i++) {
-        setActiveStepIndex(i);
-        const step = selectedWorkflow.steps[i];
-        const agent = agentsMap[step.agentId];
+      const pipeline = await runWorkflowPipeline({
+        workflow: selectedWorkflow,
+        agents: agentsMap,
+        initialPrompt: initialPrompt.trim(),
+        apiKey,
+        providerKeys,
+        bridgeFn: fetchProviderBridge,
+        mcpFn: fetchMcpBridge,
+        mcpListFn: fetchMcpTools,
+        signal: controller.signal,
+        onStepStart: setActiveStepIndex,
+        onStepResult: (result, index) => {
+          setPipelineResults((prev) => [...prev, result]);
+          // Cada paso queda en el historial: antes los workflows no dejaban
+          // rastro. Los omitidos no se registran, no hubo ejecución.
+          if (result.status !== 'skipped') {
+            onSaveRunHistory(workflowStepToRun(result, index));
+          }
+        },
+      });
 
-        if (!agent) {
-          // Antes los pasos sin agente se saltaban en silencio y los resultados
-          // se mapeaban por índice, atribuyendo salidas al agente equivocado.
-          setPipelineResults((prev) => [
-            ...prev,
-            {
-              stepId: step.id,
-              stepName: step.stepName,
-              agentName: `Agente ${step.agentId} (no encontrado)`,
-              agentAvatar: '⚠️',
-              output: `El paso "${step.stepName}" referencia el agente ${step.agentId}, que ya no existe. Se omite.`,
-              simulated: false,
-              failed: true,
-            },
-          ]);
-          continue;
-        }
-
-        const promptForStep = step.customInstruction
-          ? `${step.customInstruction}\n\n[CONTEXTO DEL AGENTE ANTERIOR]:\n${currentInput}`
-          : currentInput;
-
-        const result = await runAgentEngine({
-          agent,
-          userPrompt: promptForStep,
-          apiKey,
-          providerKeys,
-          bridgeFn: fetchProviderBridge,
-          mcpFn: fetchMcpBridge,
-          mcpListFn: fetchMcpTools,
-        });
-
-        currentInput = result.finalOutput;
-
-        setPipelineResults((prev) => [
-          ...prev,
-          {
-            stepId: step.id,
-            stepName: step.stepName,
-            agentName: agent.name,
-            agentAvatar: agent.avatar,
-            output: result.finalOutput,
-            simulated: result.simulated,
-            failed: false,
-          },
-        ]);
-
-        // Cada paso queda en el historial: antes los workflows no dejaban rastro.
-        onSaveRunHistory({
-          id: `run-wf-${Date.now()}-${i}`,
-          agentId: agent.id,
-          agentName: agent.name,
-          agentAvatar: agent.avatar,
-          agentRole: agent.role,
-          prompt: promptForStep,
-          status: 'completed',
-          steps: result.steps,
-          finalOutput: result.finalOutput,
-          metrics: result.metrics,
-          timestamp: new Date().toISOString(),
-          source: 'web',
-          simulated: result.simulated,
-          provider: result.provider,
-        });
+      if (pipeline.failed) {
+        setRunError(pipeline.stepResults.at(-1)?.error ?? 'El pipeline falló.');
+      } else if (pipeline.aborted) {
+        setRunError('Pipeline detenido por el usuario.');
       }
     } catch (err) {
-      // Sin este catch, un fallo dejaba isRunning en true para siempre y el
-      // botón quedaba bloqueado hasta recargar la página.
+      // Salvaguarda: `runWorkflowPipeline` ya captura los fallos por paso, pero
+      // sin este catch un error inesperado dejaría isRunning en true para
+      // siempre y el botón bloqueado hasta recargar la página.
       setRunError(err instanceof Error ? err.message : String(err));
     } finally {
+      abortRef.current = null;
       setActiveStepIndex(null);
       setIsRunning(false);
     }
   };
 
-  const handleAddAgentToNewWorkflow = (agentId: string) => {
-    setNewSteps((prev) => [...prev, { agentId, instruction: '' }]);
+  const handleStopWorkflow = () => {
+    abortRef.current?.abort();
   };
 
-  const handleRemoveStepFromNewWorkflow = (index: number) => {
-    setNewSteps((prev) => prev.filter((_, idx) => idx !== index));
+  const resetForm = () => {
+    setEditingWorkflowId(null);
+    setEditingCreatedAt(null);
+    setDraftName('');
+    setDraftDesc('');
+    setDraftSteps([]);
   };
 
-  const handleUpdateStepInstruction = (index: number, instruction: string) => {
-    setNewSteps((prev) => prev.map((s, idx) => (idx === index ? { ...s, instruction } : s)));
+  const handleToggleCreate = () => {
+    if (isFormOpen) {
+      setIsFormOpen(false);
+      resetForm();
+      return;
+    }
+    resetForm();
+    setIsFormOpen(true);
   };
 
-  const handleSaveNewWorkflow = () => {
-    if (!newWorkflowName.trim() || newSteps.length === 0) return;
+  const handleEditWorkflow = (wf: WorkflowConfig) => {
+    // Se selecciona también: si no, editas un workflow mientras el diagrama de
+    // la derecha sigue mostrando otro.
+    setSelectedWorkflowId(wf.id);
+    setEditingWorkflowId(wf.id);
+    setEditingCreatedAt(wf.createdAt);
+    setDraftName(wf.name);
+    setDraftDesc(wf.description);
+    setDraftSteps(
+      wf.steps.map((s) => ({
+        agentId: s.agentId,
+        instruction: s.customInstruction ?? '',
+        stepName: stripStepNumber(s.stepName),
+      }))
+    );
+    setIsFormOpen(true);
+  };
 
-    const newWf: WorkflowConfig = {
-      id: 'wf-' + Date.now(),
-      name: newWorkflowName.trim(),
-      description: newWorkflowDesc.trim() || 'Flujo multi-agente personalizado.',
-      steps: newSteps.map((s, index) => {
-        const agent = agentsMap[s.agentId];
-        return {
-          id: `step-${index + 1}`,
-          agentId: s.agentId,
-          stepName: `${index + 1}. ${agent?.name || 'Agente'}`,
-          // Vacío en vez de un placeholder inútil: sin instrucción, el paso
-          // recibe tal cual la salida del anterior.
-          customInstruction: s.instruction.trim() || undefined,
-        };
-      }),
-      createdAt: new Date().toISOString(),
+  const handleAddAgentToDraft = (agentId: string) => {
+    setDraftSteps((prev) => [
+      ...prev,
+      { agentId, instruction: '', stepName: agentsMap[agentId]?.name ?? 'Agente' },
+    ]);
+  };
+
+  const handleRemoveDraftStep = (index: number) => {
+    setDraftSteps((prev) => prev.filter((_, idx) => idx !== index));
+  };
+
+  const handleUpdateDraftInstruction = (index: number, instruction: string) => {
+    setDraftSteps((prev) => prev.map((s, idx) => (idx === index ? { ...s, instruction } : s)));
+  };
+
+  const handleUpdateDraftStepName = (index: number, stepName: string) => {
+    setDraftSteps((prev) => prev.map((s, idx) => (idx === index ? { ...s, stepName } : s)));
+  };
+
+  const handleMoveDraftStep = (index: number, direction: -1 | 1) => {
+    const target = index + direction;
+    setDraftSteps((prev) => {
+      if (target < 0 || target >= prev.length) return prev;
+      const next = [...prev];
+      [next[index], next[target]] = [next[target], next[index]];
+      return next;
+    });
+  };
+
+  const handleSaveDraft = () => {
+    if (!draftName.trim() || draftSteps.length === 0) return;
+
+    const wf: WorkflowConfig = {
+      id: editingWorkflowId ?? 'wf-' + Date.now(),
+      name: draftName.trim(),
+      description: draftDesc.trim() || 'Flujo multi-agente personalizado.',
+      steps: draftSteps.map((s, index) => ({
+        id: `step-${index + 1}`,
+        agentId: s.agentId,
+        // Solo se renumera el prefijo; la etiqueta la conserva el borrador para
+        // que reordenar o editar no borre los nombres descriptivos.
+        stepName: `${index + 1}. ${stripStepNumber(s.stepName) || agentsMap[s.agentId]?.name || 'Agente'}`,
+        // Vacío en vez de un placeholder inútil: sin instrucción, el paso
+        // recibe tal cual la salida del anterior.
+        customInstruction: s.instruction.trim() || undefined,
+      })),
+      // El formulario no toca el bot, pero reconstruye el objeto entero: sin
+      // arrastrar la config, editar un workflow lo desenrolaría de Telegram.
+      telegramConfig: editingWorkflowId
+        ? workflows.find((w) => w.id === editingWorkflowId)?.telegramConfig
+        : undefined,
+      createdAt: editingCreatedAt ?? new Date().toISOString(),
     };
 
-    onSaveWorkflow(newWf);
-    setSelectedWorkflowId(newWf.id);
-    setIsCreating(false);
-    setNewWorkflowName('');
-    setNewWorkflowDesc('');
-    setNewSteps([]);
+    onSaveWorkflow(wf);
+    setSelectedWorkflowId(wf.id);
+    setIsFormOpen(false);
+    resetForm();
   };
 
   const handleDelete = (wf: WorkflowConfig) => {
@@ -214,6 +252,10 @@ export const WorkflowBuilder: React.FC<WorkflowBuilderProps> = ({
     if (selectedWorkflowId === wf.id) {
       setSelectedWorkflowId(workflows.find((w) => w.id !== wf.id)?.id ?? null);
       setPipelineResults([]);
+    }
+    if (editingWorkflowId === wf.id) {
+      setIsFormOpen(false);
+      resetForm();
     }
     onDeleteWorkflow(wf.id);
   };
@@ -234,33 +276,35 @@ export const WorkflowBuilder: React.FC<WorkflowBuilderProps> = ({
         </div>
 
         <button
-          onClick={() => setIsCreating(!isCreating)}
+          onClick={handleToggleCreate}
           className="flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white shadow-md shadow-indigo-600/20 transition-all"
         >
           <Plus className="w-4 h-4" />
-          {isCreating ? 'Cancelar' : 'Crear Nuevo Workflow'}
+          {isFormOpen ? 'Cancelar' : 'Crear Nuevo Workflow'}
         </button>
       </div>
 
-      {/* Formulario de creación */}
-      {isCreating && (
+      {/* Formulario de alta / edición */}
+      {isFormOpen && (
         <div className="glass-panel rounded-2xl p-6 border border-indigo-500/30 space-y-4">
           <h3 className="text-sm font-bold text-slate-100">
-            Crear Flujo Multi-Agente Personalizado
+            {editingWorkflowId
+              ? `Editar Workflow: ${draftName || 'sin nombre'}`
+              : 'Crear Flujo Multi-Agente Personalizado'}
           </h3>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <input
               type="text"
               placeholder="Nombre del Workflow (ej: Pipeline de Auditoría de IA)"
-              value={newWorkflowName}
-              onChange={(e) => setNewWorkflowName(e.target.value)}
+              value={draftName}
+              onChange={(e) => setDraftName(e.target.value)}
               className="px-3.5 py-2 rounded-xl glass-input text-xs"
             />
             <input
               type="text"
               placeholder="Descripción breve..."
-              value={newWorkflowDesc}
-              onChange={(e) => setNewWorkflowDesc(e.target.value)}
+              value={draftDesc}
+              onChange={(e) => setDraftDesc(e.target.value)}
               className="px-3.5 py-2 rounded-xl glass-input text-xs"
             />
           </div>
@@ -273,7 +317,7 @@ export const WorkflowBuilder: React.FC<WorkflowBuilderProps> = ({
               {agents.map((agent) => (
                 <button
                   key={agent.id}
-                  onClick={() => handleAddAgentToNewWorkflow(agent.id)}
+                  onClick={() => handleAddAgentToDraft(agent.id)}
                   className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 border border-white/10 text-xs text-slate-300 hover:text-white hover:border-indigo-500 transition-all"
                 >
                   <span>{agent.avatar}</span>
@@ -287,12 +331,12 @@ export const WorkflowBuilder: React.FC<WorkflowBuilderProps> = ({
               <span className="text-[11px] font-bold text-slate-400 block">
                 Secuencia e instrucciones por paso:
               </span>
-              {newSteps.length === 0 && (
+              {draftSteps.length === 0 && (
                 <p className="text-[11px] text-slate-500">
                   Aún no has añadido ningún agente al flujo.
                 </p>
               )}
-              {newSteps.map((s, idx) => {
+              {draftSteps.map((s, idx) => {
                 const a = agentsMap[s.agentId];
                 return (
                   <div
@@ -301,11 +345,27 @@ export const WorkflowBuilder: React.FC<WorkflowBuilderProps> = ({
                   >
                     <span className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-indigo-600/30 text-indigo-200 border border-indigo-500/40 text-xs shrink-0">
                       <span className="font-mono text-[10px]">{idx + 1}</span>
-                      <span>{a?.avatar}</span>
-                      <span>{a?.name}</span>
+                      <span>{a?.avatar ?? '⚠️'}</span>
+                      <span>{a?.name ?? `Agente ${s.agentId} (no encontrado)`}</span>
                       <button
-                        onClick={() => handleRemoveStepFromNewWorkflow(idx)}
-                        className="ml-1 text-rose-400 hover:text-rose-300"
+                        onClick={() => handleMoveDraftStep(idx, -1)}
+                        disabled={idx === 0}
+                        className="ml-1 text-indigo-300 hover:text-white disabled:opacity-30 disabled:hover:text-indigo-300"
+                        aria-label={`Subir paso ${idx + 1}`}
+                      >
+                        <ChevronUp className="w-3 h-3" />
+                      </button>
+                      <button
+                        onClick={() => handleMoveDraftStep(idx, 1)}
+                        disabled={idx === draftSteps.length - 1}
+                        className="text-indigo-300 hover:text-white disabled:opacity-30 disabled:hover:text-indigo-300"
+                        aria-label={`Bajar paso ${idx + 1}`}
+                      >
+                        <ChevronDown className="w-3 h-3" />
+                      </button>
+                      <button
+                        onClick={() => handleRemoveDraftStep(idx)}
+                        className="text-rose-400 hover:text-rose-300"
                         aria-label={`Quitar paso ${idx + 1}`}
                       >
                         <Trash2 className="w-3 h-3" />
@@ -313,9 +373,17 @@ export const WorkflowBuilder: React.FC<WorkflowBuilderProps> = ({
                     </span>
                     <input
                       type="text"
+                      placeholder="Nombre del paso"
+                      aria-label={`Nombre del paso ${idx + 1}`}
+                      value={s.stepName}
+                      onChange={(e) => handleUpdateDraftStepName(idx, e.target.value)}
+                      className="w-full md:w-44 px-3 py-1.5 rounded-lg glass-input text-[11px] shrink-0"
+                    />
+                    <input
+                      type="text"
                       placeholder="Instrucción para este paso (opcional)"
                       value={s.instruction}
-                      onChange={(e) => handleUpdateStepInstruction(idx, e.target.value)}
+                      onChange={(e) => handleUpdateDraftInstruction(idx, e.target.value)}
                       className="flex-1 px-3 py-1.5 rounded-lg glass-input text-[11px]"
                     />
                   </div>
@@ -326,11 +394,11 @@ export const WorkflowBuilder: React.FC<WorkflowBuilderProps> = ({
 
           <div className="flex justify-end gap-2 pt-2">
             <button
-              onClick={handleSaveNewWorkflow}
-              disabled={!newWorkflowName.trim() || newSteps.length === 0}
+              onClick={handleSaveDraft}
+              disabled={!draftName.trim() || draftSteps.length === 0}
               className="px-4 py-2 rounded-xl text-xs font-bold bg-emerald-600 hover:bg-emerald-500 disabled:bg-slate-800 disabled:text-slate-400 text-white shadow-md"
             >
-              Guardar Workflow
+              {editingWorkflowId ? 'Guardar Cambios' : 'Guardar Workflow'}
             </button>
           </div>
         </div>
@@ -361,11 +429,30 @@ export const WorkflowBuilder: React.FC<WorkflowBuilderProps> = ({
                   >
                     <div className="text-xs font-bold text-slate-100">{wf.name}</div>
                     <div className="text-[10px] text-slate-400 mt-1">{wf.description}</div>
-                    <div className="text-[10px] text-indigo-400 font-mono mt-2">
-                      {wf.steps.length} pasos secuenciales
+                    <div className="text-[10px] text-indigo-400 font-mono mt-2 flex items-center gap-2 flex-wrap">
+                      <span>{wf.steps.length} pasos secuenciales</span>
+                      {wf.telegramConfig?.status === 'connected' && wf.telegramConfig.botUsername && (
+                        <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-cyan-500/15 text-cyan-300 border border-cyan-500/30">
+                          <Send className="w-2.5 h-2.5" />@{wf.telegramConfig.botUsername}
+                        </span>
+                      )}
                     </div>
                   </button>
-                  <div className="px-3.5 pb-2.5 flex justify-end">
+                  <div className="px-3.5 pb-2.5 flex justify-end gap-3">
+                    <button
+                      onClick={() => onOpenTelegram(wf)}
+                      className="flex items-center gap-1 text-[10px] text-slate-500 hover:text-cyan-300 transition-colors"
+                    >
+                      <Send className="w-3 h-3" />
+                      Telegram
+                    </button>
+                    <button
+                      onClick={() => handleEditWorkflow(wf)}
+                      className="flex items-center gap-1 text-[10px] text-slate-500 hover:text-indigo-300 transition-colors"
+                    >
+                      <Pencil className="w-3 h-3" />
+                      Editar
+                    </button>
                     <button
                       onClick={() => handleDelete(wf)}
                       className="flex items-center gap-1 text-[10px] text-slate-500 hover:text-rose-400 transition-colors"
@@ -387,30 +474,32 @@ export const WorkflowBuilder: React.FC<WorkflowBuilderProps> = ({
               id="pipeline-prompt"
               rows={4}
               value={initialPrompt}
+              placeholder="Describe la tarea que recorrerá toda la cadena de agentes..."
               onChange={(e) => setInitialPrompt(e.target.value)}
               className="w-full px-3 py-2 rounded-xl glass-input text-xs leading-relaxed"
             />
-            <button
-              onClick={handleRunWorkflow}
-              disabled={isRunning || !selectedWorkflow || !initialPrompt.trim()}
-              className={`w-full flex items-center justify-center gap-2 py-3 rounded-xl text-xs font-bold text-white shadow-lg transition-all ${
-                isRunning || !selectedWorkflow || !initialPrompt.trim()
-                  ? 'bg-slate-800 text-slate-400 cursor-not-allowed'
-                  : 'bg-gradient-to-r from-indigo-600 to-cyan-600 hover:brightness-110 shadow-indigo-600/20 active:scale-95'
-              }`}
-            >
-              {isRunning ? (
-                <>
-                  <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                  Ejecutando Pipeline...
-                </>
-              ) : (
-                <>
-                  <Play className="w-4 h-4 fill-current" />
-                  Ejecutar Pipeline Completo
-                </>
-              )}
-            </button>
+            {isRunning ? (
+              <button
+                onClick={handleStopWorkflow}
+                className="w-full flex items-center justify-center gap-2 py-3 rounded-xl text-xs font-bold text-white shadow-lg bg-rose-600 hover:bg-rose-500 transition-all"
+              >
+                <Square className="w-4 h-4 fill-current" />
+                Detener tras el paso actual
+              </button>
+            ) : (
+              <button
+                onClick={handleRunWorkflow}
+                disabled={!selectedWorkflow || !initialPrompt.trim()}
+                className={`w-full flex items-center justify-center gap-2 py-3 rounded-xl text-xs font-bold text-white shadow-lg transition-all ${
+                  !selectedWorkflow || !initialPrompt.trim()
+                    ? 'bg-slate-800 text-slate-400 cursor-not-allowed'
+                    : 'bg-gradient-to-r from-indigo-600 to-cyan-600 hover:brightness-110 shadow-indigo-600/20 active:scale-95'
+                }`}
+              >
+                <Play className="w-4 h-4 fill-current" />
+                Ejecutar Pipeline Completo
+              </button>
+            )}
 
             {runError && (
               <div className="flex items-start gap-2 p-3 rounded-xl bg-rose-950/40 border border-rose-500/30 text-[11px] text-rose-300">
@@ -500,12 +589,28 @@ export const WorkflowBuilder: React.FC<WorkflowBuilderProps> = ({
                         )}
                       </span>
                       <span
-                        className={`text-[10px] font-mono ${res.failed ? 'text-rose-400' : 'text-emerald-400'}`}
+                        className={`text-[10px] font-mono flex items-center gap-1 ${
+                          res.status === 'completed'
+                            ? 'text-emerald-400'
+                            : res.status === 'skipped'
+                              ? 'text-amber-400'
+                              : 'text-rose-400'
+                        }`}
                       >
-                        {res.failed ? `Paso ${idx + 1} omitido` : `Paso ${idx + 1} completado`}
+                        {res.status === 'skipped' && <SkipForward className="w-3 h-3" />}
+                        {res.status === 'failed' && <AlertCircle className="w-3 h-3" />}
+                        {res.status === 'completed'
+                          ? `Paso ${idx + 1} completado`
+                          : res.status === 'skipped'
+                            ? `Paso ${idx + 1} omitido`
+                            : `Paso ${idx + 1} falló`}
                       </span>
                     </div>
-                    <Markdown className="text-slate-300">{res.output}</Markdown>
+                    {res.status === 'failed' ? (
+                      <p className="text-[11px] text-rose-300">{res.error}</p>
+                    ) : (
+                      <Markdown className="text-slate-300">{res.output}</Markdown>
+                    )}
                   </div>
                 ))}
               </div>

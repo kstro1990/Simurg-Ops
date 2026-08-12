@@ -16,7 +16,12 @@ import { ExecutionPanel } from '@/components/ExecutionPanel';
 import { WorkflowBuilder } from '@/components/WorkflowBuilder';
 import { HistoryModal } from '@/components/HistoryModal';
 import { ApiKeyModal } from '@/components/ApiKeyModal';
-import { TelegramModal } from '@/components/TelegramModal';
+import {
+  TelegramModal,
+  TelegramTarget,
+  agentTelegramTarget,
+  workflowTelegramTarget,
+} from '@/components/TelegramModal';
 import { Search, Sparkles, Send } from 'lucide-react';
 
 const TELEGRAM_POLL_INTERVAL_MS = 3000;
@@ -36,7 +41,8 @@ export default function Home() {
   const [isAgentModalOpen, setIsAgentModalOpen] = useState(false);
   const [editingAgent, setEditingAgent] = useState<AgentConfig | null>(null);
   const [isApiKeyModalOpen, setIsApiKeyModalOpen] = useState(false);
-  const [telegramAgent, setTelegramAgent] = useState<AgentConfig | null>(null);
+  // Un único modal de Telegram para agentes y workflows.
+  const [telegramTarget, setTelegramTarget] = useState<TelegramTarget | null>(null);
 
   // Búsqueda y filtros
   const [searchQuery, setSearchQuery] = useState('');
@@ -153,15 +159,17 @@ export default function Home() {
     loadInitialData();
   }, []);
 
-  const hasEnrolledTelegramAgents = agents.some(
-    (a) => a.telegramConfig?.enabled && a.telegramConfig?.botToken
-  );
+  // Cuenta agentes Y workflows: si solo mirara agentes, una instalación con
+  // únicamente workflows enrolados nunca arrancaría el sondeo.
+  const hasEnrolledTelegramBots =
+    agents.some((a) => a.telegramConfig?.enabled && a.telegramConfig?.botToken) ||
+    workflows.some((w) => w.telegramConfig?.enabled && w.telegramConfig?.botToken);
 
   // Sondeo de Telegram. Los offsets y los agentes viven en el servidor; aquí
   // solo se dispara el tick y se recogen las ejecuciones nuevas.
   const isPollingRef = useRef(false);
   useEffect(() => {
-    if (!hasEnrolledTelegramAgents) return;
+    if (!hasEnrolledTelegramBots) return;
 
     let cancelled = false;
 
@@ -192,7 +200,7 @@ export default function Home() {
       cancelled = true;
       window.clearInterval(intervalId);
     };
-  }, [hasEnrolledTelegramAgents]);
+  }, [hasEnrolledTelegramBots]);
 
   const saveAgentsToStorage = useCallback(async (newAgents: AgentConfig[]) => {
     setAgents(newAgents);
@@ -250,6 +258,16 @@ export default function Home() {
     saveAgentsToStorage(updated);
   };
 
+  const handleSaveWorkflowTelegramConfig = (
+    workflowId: string,
+    telegramConfig: TelegramConfig
+  ) => {
+    const target = workflows.find((w) => w.id === workflowId);
+    if (!target) return;
+    // Reutiliza el upsert por id de handleSaveWorkflow, que además persiste.
+    handleSaveWorkflow({ ...target, telegramConfig });
+  };
+
   const handleDeleteAgent = async (agentId: string) => {
     const agent = agents.find((a) => a.id === agentId);
     if (
@@ -289,15 +307,26 @@ export default function Home() {
   };
 
   const handleSaveWorkflow = async (newWf: WorkflowConfig) => {
-    const updated = [newWf, ...workflows];
+    // Upsert por id: editar un workflow reenvía el mismo id, y un prepend ciego
+    // lo duplicaba en la lista.
+    const exists = workflows.some((w) => w.id === newWf.id);
+    const updated = exists ? workflows.map((w) => (w.id === newWf.id ? newWf : w)) : [newWf, ...workflows];
     setWorkflows(updated);
     localStorage.setItem('aether_workflows', JSON.stringify(updated));
     try {
-      await fetch('/api/workflows', {
+      const res = await fetch('/api/workflows', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(newWf),
       });
+      const data = await res.json();
+      if (data.success && Array.isArray(data.workflows)) {
+        // El servidor es la fuente autoritativa; localStorage solo es respaldo.
+        setWorkflows(data.workflows);
+        localStorage.setItem('aether_workflows', JSON.stringify(data.workflows));
+      } else if (data.error) {
+        console.error('El servidor rechazó el workflow:', data.error);
+      }
     } catch (err) {
       console.error('Error saving workflow to server:', err);
     }
@@ -482,7 +511,7 @@ export default function Home() {
                   }}
                   onClone={handleCloneAgent}
                   onDelete={handleDeleteAgent}
-                  onOpenTelegramModal={setTelegramAgent}
+                  onOpenTelegramModal={(a) => setTelegramTarget(agentTelegramTarget(a))}
                 />
               ))}
             </div>
@@ -510,6 +539,7 @@ export default function Home() {
             providerKeys={providerKeys}
             onSaveWorkflow={handleSaveWorkflow}
             onDeleteWorkflow={handleDeleteWorkflow}
+            onOpenTelegram={(wf) => setTelegramTarget(workflowTelegramTarget(wf))}
             onSaveRunHistory={handleSaveRunHistory}
           />
         )}
@@ -541,14 +571,18 @@ export default function Home() {
         />
       )}
 
-      {telegramAgent && (
+      {telegramTarget && (
         <TelegramModal
-          key={telegramAgent.id}
-          onClose={() => setTelegramAgent(null)}
-          agent={telegramAgent}
+          key={`${telegramTarget.kind}-${telegramTarget.id}`}
+          onClose={() => setTelegramTarget(null)}
+          target={telegramTarget}
           apiKey={apiKey}
           providerKeys={providerKeys}
-          onSaveTelegramConfig={handleSaveTelegramConfig}
+          onSaveTelegramConfig={
+            telegramTarget.kind === 'workflow'
+              ? handleSaveWorkflowTelegramConfig
+              : handleSaveTelegramConfig
+          }
         />
       )}
     </div>
