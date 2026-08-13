@@ -1,9 +1,12 @@
 import { execFile } from 'child_process';
+import { randomUUID } from 'crypto';
+import { mkdir, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
+import { join } from 'path';
 import { promisify } from 'util';
 import { AgentModel } from '@/types/agent';
 import { BridgeRequest, BridgeResult } from '@/types/bridge';
-import { McpTraceEntry, MCP_MAX_ITERATIONS } from '@/types/mcp';
+import { McpServerConfig, McpTraceEntry, MCP_MAX_ITERATIONS } from '@/types/mcp';
 import {
   flattenTranscript,
   toAnthropicMessages,
@@ -15,6 +18,12 @@ import { listMcpTools, runMcpBridge } from './mcpClient';
 const execFilePromise = promisify(execFile);
 
 const CLI_TIMEOUT_MS = 60_000;
+
+/**
+ * Mismo directorio que usa `serverStorage`, sin importarlo: aquí sólo se
+ * necesita un sitio de escritura que quede fuera del alcance del CLI de Copilot.
+ */
+const HARNESS_DATA_DIR = join(process.cwd(), 'data');
 
 /**
  * IDs vigentes de la Messages API de Anthropic. Los antiguos (claude-3-7-sonnet-*,
@@ -304,9 +313,82 @@ interface CopilotEvent {
     outputTokens?: number;
     message?: string;
     error?: string;
+    // Eventos de tool: el CLI identifica las de MCP con servidor y tool aparte
+    // de `toolName`, que llega aliaseado como `<servidor>-<tool>`.
+    toolCallId?: string;
+    turnId?: string;
+    mcpServerName?: string;
+    mcpToolName?: string;
+    arguments?: Record<string, unknown>;
+    success?: boolean;
+    result?: { content?: string };
   };
   exitCode?: number;
   error?: string;
+}
+
+/**
+ * Traduce los servidores MCP del arnés al fichero de configuración que entiende
+ * `copilot --additional-mcp-config`.
+ *
+ * El nombre del servidor es la clave del objeto y, además, la primera mitad del
+ * patrón de permisos (`<servidor>(<tool>)`), así que se normaliza a lo que el
+ * CLI puede casar: un nombre con espacios o paréntesis rompería la regla en
+ * silencio, que es el peor fallo posible aquí — el modelo se quedaría sin la
+ * tool en vez de sin permiso, y sin decirlo.
+ */
+function copilotServerName(server: McpServerConfig): string {
+  return (server.name || server.id).replace(/[^a-zA-Z0-9_-]/g, '_');
+}
+
+function toCopilotMcpConfig(servers: McpServerConfig[]): string {
+  const mcpServers: Record<string, unknown> = {};
+
+  for (const server of servers) {
+    mcpServers[copilotServerName(server)] =
+      server.transport === 'http'
+        ? { type: 'http', url: server.url, headers: server.headers ?? {}, tools: ['*'] }
+        : {
+            type: 'local',
+            command: server.command,
+            args: server.args ?? [],
+            env: server.env ?? {},
+            tools: ['*'],
+          };
+  }
+
+  return JSON.stringify({ mcpServers });
+}
+
+/**
+ * Flags de permisos para la sesión de Copilot.
+ *
+ * Las reglas de denegación se ponen primero y son lo único que de verdad acota
+ * al agente: comprobado que con sólo `--available-tools`/`--allow-tool` el
+ * modelo, al que se le niega una tool MCP de escritura, **se va por el shell** y
+ * lanza `curl` contra la API del servicio. El CLI documenta que la denegación
+ * gana siempre, incluso sobre `--allow-all-tools`, así que shell, escritura en
+ * disco y acceso a URLs se cierran de forma explícita.
+ *
+ * Después se permiten una a una las tools MCP declaradas en `allowedTools`, para
+ * que no haya prompts de aprobación (imposibles de contestar en no interactivo).
+ * `allowedTools` vacío significa "todas las del servidor", igual que en el resto
+ * del arnés, y se expresa omitiendo el nombre de tool en el patrón.
+ */
+function copilotPermissionArgs(servers: McpServerConfig[]): string[] {
+  const args = ['--deny-tool', 'shell', '--deny-tool', 'write', '--deny-tool', 'url'];
+
+  for (const server of servers) {
+    const name = copilotServerName(server);
+    const tools = server.allowedTools ?? [];
+    if (tools.length === 0) {
+      args.push('--allow-tool', name);
+      continue;
+    }
+    for (const tool of tools) args.push('--allow-tool', `${name}(${tool})`);
+  }
+
+  return args;
 }
 
 /**
@@ -320,11 +402,18 @@ function parseCopilotJsonl(stdout: string): {
   outputTokens: number;
   exitCode?: number;
   errorText?: string;
+  toolTrace: McpTraceEntry[];
 } {
   let output = '';
   let outputTokens = 0;
   let exitCode: number | undefined;
   let errorText: string | undefined;
+  let currentTurn: string | undefined;
+
+  // El bucle agéntico corre dentro del binario, así que sus pasos no pueden
+  // emitirse en vivo: se reconstruyen aquí, igual que en la ruta de Anthropic.
+  const toolTrace: McpTraceEntry[] = [];
+  const pending = new Map<string, McpTraceEntry>();
 
   for (const line of stdout.split('\n')) {
     const trimmed = line.trim();
@@ -338,8 +427,35 @@ function parseCopilotJsonl(stdout: string): {
     }
 
     if (event.type === 'assistant.message' && event.data?.content) {
+      // Con tools el CLI emite un mensaje por turno, y los previos son
+      // narración de lo que va a hacer ("déjame leer el fichero…"): sólo el
+      // último turno es la respuesta. Sin tools hay un único turno, así que el
+      // resultado es idéntico al de antes.
+      const turn = event.data.turnId ?? '';
+      if (turn !== currentTurn) {
+        currentTurn = turn;
+        output = '';
+      }
       output += (output ? '\n\n' : '') + event.data.content;
       outputTokens += event.data.outputTokens ?? 0;
+    } else if (event.type === 'tool.execution_start' && event.data?.mcpServerName) {
+      // Sólo se traza MCP: el CLI tiene tools propias (bash, view…) que aquí
+      // están denegadas y que en la traza sólo serían ruido.
+      const entry: McpTraceEntry = {
+        server: event.data.mcpServerName,
+        tool: event.data.mcpToolName ?? '',
+        arguments: event.data.arguments ?? {},
+        ok: false,
+      };
+      if (event.data.toolCallId) pending.set(event.data.toolCallId, entry);
+      toolTrace.push(entry);
+    } else if (event.type === 'tool.execution_complete' && event.data?.toolCallId) {
+      const entry = pending.get(event.data.toolCallId);
+      if (entry) {
+        entry.ok = event.data.success === true;
+        entry.output = event.data.result?.content;
+        pending.delete(event.data.toolCallId);
+      }
     } else if (event.type === 'error' || event.type === 'session.error') {
       errorText = event.data?.message || event.data?.error || event.error;
     } else if (event.type === 'result') {
@@ -347,7 +463,7 @@ function parseCopilotJsonl(stdout: string): {
     }
   }
 
-  return { output: output.trim(), outputTokens, exitCode, errorText };
+  return { output: output.trim(), outputTokens, exitCode, errorText, toolTrace };
 }
 
 /**
@@ -365,6 +481,12 @@ function parseCopilotJsonl(stdout: string): {
  * - `-C` apunta al directorio temporal y `--no-custom-instructions` evita que el
  *   AGENTS.md del repo se cuele en el prompt de todos los agentes.
  * - `temperature` y `maxTokens` no tienen equivalente en el CLI: se ignoran.
+ *
+ * Con servidores MCP en modo agéntico se añade `--additional-mcp-config`. El
+ * flag acepta el JSON en línea, pero se pasa como fichero temporal a 0600
+ * porque en línea acabaría en el `argv` del proceso, visible en `ps` para
+ * cualquier usuario de la máquina, y ese JSON lleva las credenciales del
+ * servidor MCP. El fichero se borra siempre, también si el CLI falla.
  */
 async function callCopilotCli(
   request: BridgeRequest,
@@ -396,6 +518,30 @@ async function callCopilotCli(
     tmpdir(),
   ];
 
+  const servers = request.mcpServers ?? [];
+  let mcpConfigPath: string | undefined;
+
+  if (servers.length > 0) {
+    // El fichero va a `data/`, NO al directorio temporal, y es deliberado: el
+    // CLI limita el acceso a ficheros a su directorio de trabajo, que es
+    // `tmpdir()` por el `-C`. Comprobado que desde ahí puede leer cualquier
+    // fichero del temporal y no puede salir de él, así que dejar la config
+    // dentro pondría las credenciales del servidor MCP al alcance del modelo.
+    await mkdir(HARNESS_DATA_DIR, { recursive: true });
+    mcpConfigPath = join(HARNESS_DATA_DIR, `.mcp-copilot-${randomUUID()}.json`);
+    await writeFile(mcpConfigPath, toCopilotMcpConfig(servers), { mode: 0o600 });
+    args.push('--additional-mcp-config', `@${mcpConfigPath}`);
+    args.push(...copilotPermissionArgs(servers));
+
+    // Cuando la salida de una tool pasa de ~80 KB el CLI la vuelca a un fichero
+    // del directorio temporal y le dice al modelo que la lea desde ahí. Con
+    // `--disallow-temp-dir` ese fichero es inalcanzable y la respuesta se corta
+    // a medias ("debo parsear el JSON…"), que es justo lo que pasa al listar un
+    // Coda grande. A cambio, el modelo puede leer el temporal del sistema.
+    const idx = args.indexOf('--disallow-temp-dir');
+    if (idx !== -1) args.splice(idx, 1);
+  }
+
   const wireModel = COPILOT_MODEL_MAP[request.model];
   if (wireModel) args.push('--model', wireModel);
 
@@ -419,6 +565,9 @@ async function callCopilotCli(
     execError = err;
     stdout = (err as { stdout?: string })?.stdout ?? '';
     stderr = (err as { stderr?: string })?.stderr ?? '';
+  } finally {
+    // El fichero lleva credenciales del servidor MCP: se borra pase lo que pase.
+    if (mcpConfigPath) await rm(mcpConfigPath, { force: true }).catch(() => {});
   }
 
   // El plan de Copilot decide qué modelos admite `--model`. En las cuentas
@@ -454,7 +603,7 @@ async function callCopilotCli(
     return { success: false, message: `Fallo al ejecutar el CLI de Copilot: ${detail}` };
   }
 
-  const { output, outputTokens, exitCode, errorText } = parseCopilotJsonl(stdout);
+  const { output, outputTokens, exitCode, errorText, toolTrace } = parseCopilotJsonl(stdout);
 
   if (!output) {
     const detail =
@@ -471,6 +620,7 @@ async function callCopilotCli(
     output,
     source: 'cli_binary',
     usage: { promptTokens: 0, completionTokens: outputTokens },
+    toolTrace: toolTrace.length > 0 ? toolTrace : undefined,
   };
 }
 

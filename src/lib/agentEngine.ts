@@ -125,12 +125,15 @@ export async function runAgentEngine(options: ExecuteAgentOptions): Promise<Agen
 
   /**
    * El tool-calling real necesita un canal en el proveedor. Gemini y Anthropic
-   * por API lo tienen; Copilot y OpenAI no están implementados aquí, y
-   * `claude-code` solo lo consigue si hay API key de Anthropic (si cae al
-   * binario CLI, es one-shot). Sin este aviso la degradación sería invisible:
-   * el agente respondería sin tools y sin decir por qué.
+   * por API lo tienen; `copilot-cli` no expone uno al arnés, pero el binario es
+   * a su vez un agente con MCP propio, así que el puente le inyecta los
+   * servidores con `--additional-mcp-config` y el bucle corre dentro del CLI.
+   * OpenAI sigue sin implementar, y `claude-code` solo lo consigue si hay API
+   * key de Anthropic (si cae al binario CLI, es one-shot). Sin este aviso la
+   * degradación sería invisible: el agente respondería sin tools y sin decir
+   * por qué.
    */
-  const AGENTIC_CAPABLE: AIProvider[] = ['gemini', 'anthropic', 'claude-code'];
+  const AGENTIC_CAPABLE: AIProvider[] = ['gemini', 'anthropic', 'claude-code', 'copilot-cli'];
 
   /**
    * El contexto de herramientas se calcula una sola vez por ejecución. Antes se
