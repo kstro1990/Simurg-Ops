@@ -36,7 +36,10 @@ yarn-error.log*
 !cli/.env.example
 
 # runtime state — contiene bot tokens y API keys en texto plano
-/data/
+# Se ignora el contenido (`/data/*`) en vez del directorio: git no desciende en un
+# directorio excluido, así que con `/data/` la excepción de abajo nunca aplicaría.
+/data/*
+!/data/agents.example.json
 
 # vercel
 .vercel
